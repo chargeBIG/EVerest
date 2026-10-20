@@ -21,6 +21,20 @@ struct IntegerWithSource {
     std::string source;
 };
 
+struct PhaseCurrentsWithSource {
+    std::optional<float> L1;
+    std::optional<float> L2;
+    std::optional<float> L3;
+    std::string source;
+};
+
+struct PhasePowersWithSource {
+    std::optional<float> L1;
+    std::optional<float> L2;
+    std::optional<float> L3;
+    std::string source;
+};
+
 struct FrequencyWattPoint {
     float frequency_Hz;
     float total_power_W;
@@ -43,6 +57,8 @@ struct PricePerkWh {
 struct LimitsReq {
     std::optional<NumberWithSource> total_power_W;
     std::optional<NumberWithSource> ac_max_current_A;
+    std::optional<PhaseCurrentsWithSource> ac_max_current_per_phase_A;
+    std::optional<PhasePowersWithSource> ac_max_power_per_phase_W;
     std::optional<NumberWithSource> ac_min_current_A;
     std::optional<IntegerWithSource> ac_max_phase_count;
     std::optional<IntegerWithSource> ac_min_phase_count;
@@ -93,6 +109,47 @@ struct CapabilityLimits {
     int32_t max_phase_count;
     float nominal_voltage_V;
     float total_power_W;
+};
+
+enum class NodeType {
+    Undefined,
+    Evse,
+    Generic,
+};
+
+enum class EvseState {
+    Unplugged,
+    WaitForAuth,
+    WaitForEnergy,
+    PrepareCharging,
+    PausedEV,
+    PausedEVSE,
+    Charging,
+    Finished,
+    Disabled,
+};
+
+struct OptimizerTarget {
+    std::optional<float> energy_amount_needed;
+    std::optional<float> charge_to_max_percent;
+    std::optional<float> car_battery_soc;
+    std::optional<std::string> leave_time;
+    std::optional<float> price_limit;
+    std::optional<bool> full_autonomy;
+};
+
+struct EnergyFlowRequest {
+    std::vector<EnergyFlowRequest> children;
+    std::string uuid;
+    NodeType node_type;
+    std::vector<ScheduleReqEntry> schedule_import;
+    std::vector<ScheduleReqEntry> schedule_export;
+    std::vector<ScheduleSetpointEntry> schedule_setpoints;
+    std::optional<bool> priority_request;
+    std::optional<EvseState> evse_state;
+    std::optional<OptimizerTarget> optimizer_target;
+    std::optional<types::powermeter::PowermeterValues> energy_usage_root;
+    std::optional<types::powermeter::PowermeterValues> energy_usage_leaves;
 };
 
 } // namespace everest::lib::API::V1_0::types::energy

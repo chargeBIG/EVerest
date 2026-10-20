@@ -5,12 +5,18 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <iterator>
+#include <limits>
+#include <set>
 
 #include "Broker.hpp"
 #include "BrokerFastCharging.hpp"
+#include "BrokerPowerRedistribution.hpp"
 #include "Market.hpp"
+#include "PowerMeterAggregator.hpp"
 
 namespace module {
 
@@ -34,14 +40,40 @@ static BrokerFastCharging::StickyNess to_stickyness(const std::string& m) {
     }
 }
 
-static BrokerFastCharging::EnergyManagerConfig to_broker_fast_charging_config(const EnergyManagerConfig& config) {
-    BrokerFastCharging::EnergyManagerConfig broker_conf;
+static BrokerStrategy to_broker_strategy(const std::string& s) {
+    if (s == "PowerRedistribution") {
+        return BrokerStrategy::PowerRedistribution;
+    }
+    // The manifest enum rejects typos; configs built otherwise are not validated.
+    if (s != "FastCharging") {
+        EVLOG_warning << "Unknown broker_strategy '" << s << "', falling back to FastCharging";
+    }
+    return BrokerStrategy::FastCharging;
+}
+
+static std::shared_ptr<Broker> make_broker(BrokerStrategy strategy, Market& market, BrokerContext& context,
+                                           const Broker::EnergyManagerConfig& broker_config) {
+    switch (strategy) {
+    case BrokerStrategy::PowerRedistribution:
+        return std::make_shared<BrokerPowerRedistribution>(market, context, broker_config);
+    case BrokerStrategy::FastCharging:
+    default:
+        return std::make_shared<BrokerFastCharging>(market, context, broker_config);
+    }
+}
+
+static Broker::EnergyManagerConfig to_broker_config(const EnergyManagerConfig& config) {
+    Broker::EnergyManagerConfig broker_conf;
 
     broker_conf.max_nr_of_switches_per_session = config.switch_3ph1ph_max_nr_of_switches_per_session;
     broker_conf.power_hysteresis_W = config.switch_3ph1ph_power_hysteresis_W;
     broker_conf.switch_1ph_3ph_mode = to_switch_1ph3ph_mode(config.switch_3ph1ph_while_charging_mode);
     broker_conf.time_hysteresis_s = config.switch_3ph1ph_time_hysteresis_s;
     broker_conf.stickyness = to_stickyness(config.switch_3ph1ph_switch_limit_stickyness);
+    broker_conf.redistribution.margin_A = config.redistribution_margin_A;
+    broker_conf.redistribution.start_with_lower_limit = config.redistribution_start_with_lower_limit;
+    broker_conf.redistribution.reduction_hold = std::chrono::seconds(config.redistribution_reduction_hold_s);
+    broker_conf.redistribution.measurement_max_age = std::chrono::seconds(config.power_meter_aggregation_window_s);
 
     return broker_conf;
 }
@@ -68,22 +100,419 @@ bool is_priority_request(const types::energy::EnergyFlowRequest& e) {
 EnergyManagerImpl::EnergyManagerImpl(
     const EnergyManagerConfig& config,
     const std::function<void(const std::vector<types::energy::EnforcedLimits>& limits)>& enforced_limits_callback) :
-    config(config), enforced_limits_callback(enforced_limits_callback) {
+    config(config),
+    broker_strategy(to_broker_strategy(config.broker_strategy)),
+    enforced_limits_callback(enforced_limits_callback) {
     this->energy_flow_request.node_type = types::energy::NodeType::Undefined;
+    if (config.phase_symmetry_enabled and broker_strategy != BrokerStrategy::PowerRedistribution) {
+        EVLOG_warning << "phase_symmetry_enabled has no effect without broker_strategy PowerRedistribution";
+    }
+}
+
+namespace {
+
+// Calls \p warn for every meter in \p current not yet in \p warned, and forgets meters that
+// have recovered so they may warn again.
+template <typename Warn>
+void warn_once_per_meter(std::set<std::string>& warned, const std::vector<std::string>& current, Warn warn) {
+    const std::set<std::string> now_faulty(current.begin(), current.end());
+    for (const auto& uuid : now_faulty) {
+        if (warned.insert(uuid).second) {
+            warn(uuid);
+        }
+    }
+    for (auto it = warned.begin(); it != warned.end();) {
+        it = now_faulty.count(*it) == 0 ? warned.erase(it) : std::next(it);
+    }
+}
+
+} // namespace
+
+void EnergyManagerImpl::warn_about_meter_timestamps(const PowerMeterAggregator::AggregateResult& aggregate) {
+    warn_once_per_meter(m_warned_unparsable_meters, aggregate.unparsable_meters, [](const std::string& uuid) {
+        EVLOG_warning << "cannot parse the power meter timestamp of meter " << uuid
+                      << ", treating its readings as stale until it recovers";
+    });
+    warn_once_per_meter(m_warned_future_meters, aggregate.future_meters, [](const std::string& uuid) {
+        EVLOG_warning << "power meter timestamp of meter " << uuid
+                      << " lies in the future beyond the aggregation window (clock or time zone error), "
+                         "treating its readings as stale until it recovers";
+    });
+    warn_once_per_meter(m_warned_far_past_meters, aggregate.far_past_meters, [](const std::string& uuid) {
+        EVLOG_warning << "power meter timestamp of meter " << uuid
+                      << " lies more than 15 minutes before the aggregation window (frozen meter, or a UTC offset "
+                         "the timestamp parser ignores), treating its readings as stale until it recovers";
+    });
+}
+
+#ifdef BUILD_TESTING_MODULE_ENERGY_MANAGER
+PowerMeterAggregator::AggregateResult EnergyManagerImpl::get_site_aggregate() const {
+    std::scoped_lock lock(energy_mutex);
+    return m_site_aggregate;
+}
+#endif
+
+EnergyManagerImpl::~EnergyManagerImpl() {
+    stop();
+}
+
+#ifdef BUILD_TESTING_MODULE_ENERGY_MANAGER
+RedistributionInference EnergyManagerImpl::get_redistribution_inference() const {
+    std::scoped_lock lock(energy_mutex);
+    return m_redistribution_inference;
+}
+
+ImbalanceResult EnergyManagerImpl::get_phase_imbalance() const {
+    std::scoped_lock lock(energy_mutex);
+    return m_phase_imbalance;
+}
+#endif
+
+namespace {
+
+std::string format_W(const std::optional<float>& value) {
+    return value.has_value() ? fmt::format("{:.0f} W", value.value()) : std::string("n/a");
+}
+
+} // namespace
+
+void EnergyManagerImpl::infer_redistribution(const Market& market, const std::vector<std::shared_ptr<Broker>>& brokers,
+                                             const std::vector<types::energy::EnforcedLimits>& limits) {
+    const auto nominal_ac_voltage = static_cast<float>(config.nominal_ac_voltage);
+    const auto connector_margin = static_cast<float>(config.power_redistribution_connector_margin);
+    const auto margin_A = static_cast<float>(config.redistribution_margin_A);
+    const auto site_margin = static_cast<float>(config.power_redistribution_site_margin);
+    const auto gain = static_cast<float>(config.power_redistribution_gain);
+    const auto hold_time = std::chrono::seconds(config.redistribution_reduction_hold_s);
+    const auto aggregation_window = std::chrono::seconds(config.power_meter_aggregation_window_s);
+    const auto now = globals.start_time;
+
+    RedistributionInference inference;
+    std::vector<SaturatedConnector> saturated;
+
+    for (const auto& broker : brokers) {
+        const auto& connector_market = broker->get_local_market();
+        const auto& node = connector_market.energy_flow_request;
+        // The broker loop created an entry for every connector.
+        auto& ctx = contexts.at(node.uuid);
+        const auto phases_drawn = static_cast<int>(ctx.phases_in_use.size());
+        const auto bounds = get_static_bounds_W(connector_market, nominal_ac_voltage, phases_drawn);
+
+        // This run's measurement is the EV's response to the previous run's allocation; a
+        // stale one yields Unknown, like a missing one.
+        std::optional<float> measured_W;
+        const auto& observed = ctx.last_observed_measurement;
+        if (observed.power_W.has_value() and is_fresh(observed.measured_at, now, aggregation_window)) {
+            measured_W = observed.power_W.value().total;
+        }
+        auto connector =
+            classify_connector(ctx.last_allocated_W, measured_W, bounds, connector_margin, ctx.last_margin_W);
+
+        const auto edge =
+            ctx.under_consuming.update(connector.connector_class == ConnectorClass::UnderConsuming, now, hold_time);
+        connector.held = ctx.under_consuming.held();
+
+        if (edge == HoldLatch::Edge::Held) {
+            EVLOG_info << fmt::format("{}: power can be reduced by {:.0f} W (allotted {}, measured {})", node.uuid,
+                                      connector.reducible_W, format_W(connector.allocated_W),
+                                      format_W(connector.measured_W));
+        } else if (edge == HoldLatch::Edge::Released) {
+            EVLOG_info << fmt::format("{}: power can no longer be reduced (allotted {}, measured {})", node.uuid,
+                                      format_W(connector.allocated_W), format_W(connector.measured_W));
+        }
+
+        if (connector.connector_class == ConnectorClass::Saturated) {
+            // Without an allocation or a static maximum there is nothing to clamp an
+            // increase against, so such a connector is not a candidate - and must not be
+            // counted among them either, or it would shrink the others' share.
+            if (const auto candidate = to_saturated_connector(node.uuid, connector, bounds)) {
+                saturated.push_back(candidate.value());
+            }
+        }
+
+        // Remember this run's allocation for the next run's comparison. Only sessions count:
+        // what an unplugged connector is allotted has no consumption to compare against, and
+        // it must not leak into the first run of the next session as a false gap.
+        ctx.last_allocated_W.reset();
+        ctx.last_margin_W = 0.f;
+        if (in_session(node)) {
+            const auto limit =
+                std::find_if(limits.begin(), limits.end(), [&node](const auto& l) { return l.uuid == node.uuid; });
+            if (limit != limits.end()) {
+                ctx.last_allocated_W = get_allocated_power_W(*limit, nominal_ac_voltage, phases_drawn);
+                ctx.last_margin_W = get_margin_power_W(*limit, margin_A, nominal_ac_voltage, phases_drawn);
+            }
+        }
+
+        inference.connectors[node.uuid] = connector;
+    }
+
+    auto site =
+        infer_site(get_grid_limit_W(market, nominal_ac_voltage), m_site_aggregate, saturated, site_margin, gain);
+    site.meter_source = m_site_meter_source;
+
+    const auto site_edge = m_site_headroom.update(site.increase_W > 0.f, now, hold_time);
+    site.held = m_site_headroom.held();
+
+    const int granted = grant_site_headroom(site);
+
+    if (site_edge == HoldLatch::Edge::Held) {
+        EVLOG_info << fmt::format(
+            "granting {:.0f} W of headroom to {} of {} saturated connector(s) (grid limit {}, measured {} from {})",
+            site.increase_W, granted, site.saturated_connectors, format_W(site.grid_limit_W), format_W(site.measured_W),
+            to_string(site.meter_source));
+    } else if (site_edge == HoldLatch::Edge::Released) {
+        EVLOG_info << fmt::format("power can no longer be increased (grid limit {}, measured {}, headroom {})",
+                                  format_W(site.grid_limit_W), format_W(site.measured_W), format_W(site.headroom_W));
+    }
+
+    if (globals.debug) {
+        EVLOG_info << fmt::format("Redistribution: grid limit {}, measured {} ({}), headroom {}, {} saturated, "
+                                  "proposed increase {:.0f} W{}",
+                                  format_W(site.grid_limit_W), format_W(site.measured_W), to_string(site.meter_source),
+                                  format_W(site.headroom_W), site.saturated_connectors, site.increase_W,
+                                  site.held ? " (held)" : "");
+        for (const auto& [uuid, connector] : inference.connectors) {
+            const auto& distributed = contexts.at(uuid).distributed_power_W;
+            EVLOG_info << fmt::format(
+                "  {}: {} allotted {}, measured {}, reducible {:.0f} W{}{}", uuid, to_string(connector.connector_class),
+                format_W(connector.allocated_W), format_W(connector.measured_W), connector.reducible_W,
+                connector.held ? " (held)" : "",
+                distributed.has_value() ? fmt::format(", granted {:.0f} W", distributed.value()) : "");
+        }
+    }
+
+    inference.site = site;
+    m_redistribution_inference = inference;
+}
+
+namespace {
+
+// Minimum current the connector's own schedule asks for at the slot in force [A]; 0 when
+// it declares none.
+float min_current_A(const Market& connector) {
+    const auto& offer = connector.get_import_max_available();
+    const auto slot = active_slot_index(offer);
+    if (not slot.has_value()) {
+        return 0.f;
+    }
+    const auto& min_current = offer[slot.value()].limits_to_root.ac_min_current_A;
+    return min_current.has_value() ? min_current.value().value : 0.f;
+}
+
+// What the connector may draw on any one phase while its measurement is unknown: the cap in
+// force, else the offer's maximum.
+float may_draw_A(const Market& connector, const BrokerContext& ctx) {
+    std::optional<float> cap_A;
+    if (ctx.redistribution_cap_A.has_value()) {
+        cap_A = to_scalar_cap(ctx.redistribution_cap_A.value());
+    }
+    if (not cap_A.has_value()) {
+        const auto& offer = connector.get_import_max_available();
+        const auto slot = active_slot_index(offer);
+        if (slot.has_value()) {
+            const auto& max_current = offer[slot.value()].limits_to_root.ac_max_current_A;
+            if (max_current.has_value()) {
+                cap_A = max_current.value().value;
+            }
+        }
+    }
+    float may_draw = cap_A.value_or(std::numeric_limits<float>::infinity());
+    if (ctx.phase_imbalance_cap_A.has_value()) {
+        may_draw = std::min(may_draw, ctx.phase_imbalance_cap_A.value());
+    }
+    return std::max(0.f, may_draw);
+}
+
+std::string format_phase_report(Phase phase, const PhaseReport& report) {
+    return fmt::format("{} +{:.1f} A (overshoot {:.1f}, corrected {:.1f}, residual {:.1f})", to_string(phase),
+                       report.imbalance_A, report.overshoot_A, report.corrected_A, report.residual_A);
+}
+
+} // namespace
+
+void EnergyManagerImpl::apply_phase_imbalance_correction(const std::vector<std::shared_ptr<Broker>>& brokers) {
+    const auto nominal_ac_voltage = static_cast<float>(config.nominal_ac_voltage);
+    const auto max_imbalance_A = static_cast<float>(config.max_phase_imbalance_A);
+    const auto hold_time = std::chrono::seconds(config.phase_imbalance_hold_s);
+    const auto aggregation_window = std::chrono::seconds(config.power_meter_aggregation_window_s);
+    const auto now = globals.start_time;
+
+    const bool any_in_session = std::any_of(brokers.begin(), brokers.end(), [](const auto& broker) {
+        return in_session(broker->get_local_market().energy_flow_request);
+    });
+
+    // A stale meter's load is missing from a leaf sum, so its phases cannot be judged.
+    if (m_site_meter_source == SiteMeterSource::LeafSum and m_site_aggregate.stale_meters > 0) {
+        report_phase_imbalance_suspension(
+            fmt::format("{} of the EVSE meters summed for the site are stale", m_site_aggregate.stale_meters),
+            any_in_session);
+        m_phase_imbalance = {};
+        return;
+    }
+
+    std::vector<ImbalanceConnector> connectors;
+    float unmeasured_A = 0.f;
+    bool any_settling = false;
+    for (const auto& broker : brokers) {
+        const auto& connector_market = broker->get_local_market();
+        const auto& node = connector_market.energy_flow_request;
+        auto& ctx = contexts.at(node.uuid);
+        if (not in_session(node)) {
+            continue;
+        }
+        if (not ctx.phase_imbalance_arrived_at.has_value()) {
+            ctx.phase_imbalance_arrived_at = now;
+        }
+        const auto& measurement = ctx.last_observed_measurement;
+        if (not is_fresh(measurement.measured_at, now, aggregation_window)) {
+            unmeasured_A += may_draw_A(connector_market, ctx);
+            continue;
+        }
+
+        ImbalanceConnector connector;
+        connector.uuid = node.uuid;
+        connector.draws_on = phases_drawn_on(measurement, nominal_ac_voltage);
+        connector.measured_A = measured_current_on(measurement, connector.draws_on, nominal_ac_voltage);
+        connector.min_A = min_current_A(connector_market);
+        connector.cap_A = ctx.phase_imbalance_cap_A;
+        // Its measurement may not reflect a cap changed within the hold yet.
+        connector.settling =
+            ctx.phase_imbalance_cap_since.has_value() and now - ctx.phase_imbalance_cap_since.value() < hold_time;
+        connector.arrived_at = ctx.phase_imbalance_arrived_at.value();
+        any_settling = any_settling or connector.settling;
+        connectors.push_back(connector);
+    }
+
+    const PhaseCurrents site_A{m_site_aggregate.current_A.L1, m_site_aggregate.current_A.L2,
+                               m_site_aggregate.current_A.L3};
+    const auto result = correct_phase_imbalance(site_A, connectors, max_imbalance_A, unmeasured_A);
+    if (not result.reference.has_value()) {
+        report_phase_imbalance_suspension("fewer than two phases of the site are measured", any_in_session);
+    } else {
+        report_phase_imbalance_suspension(std::nullopt, any_in_session);
+    }
+    if (not result.support_settled) {
+        EVLOG_debug << "Phase imbalance: support did not settle, capping without support from the other phases";
+    }
+
+    for (const auto& cap : result.caps) {
+        auto& ctx = contexts.at(cap.uuid);
+        ctx.phase_imbalance_cap_A = cap.new_cap_A;
+        ctx.phase_imbalance_cap_since = now;
+        if (cap.new_cap_A <= 0.f) {
+            EVLOG_info << fmt::format("{}: phase imbalance, paused until its phase has room for it", cap.uuid);
+        } else {
+            EVLOG_info << fmt::format("{}: phase imbalance, {} to {:.1f} A", cap.uuid,
+                                      cap.cut_A >= 0.f ? "limiting" : "raising the limit", cap.new_cap_A);
+        }
+    }
+    for (const auto& uuid : result.released) {
+        auto& ctx = contexts.at(uuid);
+        EVLOG_info << fmt::format("{}: draws on all phases, releasing the {:.1f} A phase imbalance limit", uuid,
+                                  ctx.phase_imbalance_cap_A.value_or(0.f));
+        ctx.phase_imbalance_cap_A = std::nullopt;
+        ctx.phase_imbalance_cap_since = std::nullopt;
+    }
+
+    // A residual is only conclusive once no cap is still settling.
+    if (not any_settling) {
+        for (const auto phase : {Phase::L1, Phase::L2, Phase::L3}) {
+            const auto& report = result.report(phase);
+            const auto edge = m_phase_residual_reported[static_cast<int>(phase)].update(report.residual_A > 0.f, now,
+                                                                                        std::chrono::seconds(0));
+            if (edge == HoldLatch::Edge::Held) {
+                EVLOG_warning << fmt::format(
+                    "phase {}: {:.1f} A above the imbalance limit that limiting connectors cannot correct",
+                    to_string(phase), report.residual_A);
+            } else if (edge == HoldLatch::Edge::Released) {
+                EVLOG_info << fmt::format("phase {}: imbalance is within reach of the connectors again",
+                                          to_string(phase));
+            }
+        }
+    }
+
+    if (globals.debug and result.reference.has_value()) {
+        EVLOG_info << fmt::format("Phase imbalance (reference {}): {}; {}; {}", to_string(result.reference.value()),
+                                  format_phase_report(Phase::L1, result.L1), format_phase_report(Phase::L2, result.L2),
+                                  format_phase_report(Phase::L3, result.L3));
+    }
+
+    m_phase_imbalance = result;
+}
+
+void EnergyManagerImpl::report_phase_imbalance_suspension(const std::optional<std::string>& reason,
+                                                          bool any_in_session) {
+    const auto edge = m_phase_imbalance_suspended.update(reason.has_value() and any_in_session, globals.start_time,
+                                                         std::chrono::seconds(0));
+    if (edge == HoldLatch::Edge::Held) {
+        EVLOG_warning << "Phase imbalance limiting suspended, " << reason.value()
+                      << ": the phase imbalance limits and pauses in force are kept";
+    } else if (edge == HoldLatch::Edge::Released) {
+        EVLOG_info << "Phase imbalance limiting resumed";
+    }
+}
+
+int EnergyManagerImpl::grant_site_headroom(const SiteInference& site) {
+    // The hold is what keeps a single optimizer cycle of headroom - an EV between two ramp
+    // steps, a load that switched off for a second - from moving an allocation.
+    const bool granting = site.held;
+
+    // Every context, not only the connectors of this run: contexts outlive a run, and a
+    // connector that has left the tree must not keep a grant that nothing will clear.
+    int granted = 0;
+    for (auto& [uuid, context] : contexts) {
+        context.distributed_power_W.reset();
+        if (not granting) {
+            continue;
+        }
+        const auto share = site.increase_W_by_connector.find(uuid);
+        if (share != site.increase_W_by_connector.end()) {
+            context.distributed_power_W = share->second;
+            granted++;
+        }
+    }
+    return granted;
 }
 
 void EnergyManagerImpl::start() {
-    // start thread to update energy optimization
-    std::thread([this] {
+    {
+        auto loop = m_loop_state.handle();
+        if (loop->running) {
+            return;
+        }
+        loop->running = true;
+    }
+
+    m_mainloop = std::thread([this] {
         while (true) {
             auto optimized_values = this->run_optimizer(energy_flow_request, date::utc_clock::now());
-            enforced_limits_callback(optimized_values);
-            {
-                std::unique_lock<std::mutex> lock(mainloop_sleep_mutex);
-                mainloop_sleep_condvar.wait_for(lock, std::chrono::seconds(config.update_interval));
+            if (not m_loop_state.handle()->running) {
+                return;
             }
+            try {
+                enforced_limits_callback(optimized_values);
+            } catch (const std::exception& e) {
+                EVLOG_error << "Failed to enforce limits: " << e.what();
+            }
+
+            auto loop = m_loop_state.handle();
+            loop.wait_for([&loop] { return not loop->running or loop->wakeup; },
+                          std::chrono::seconds(config.update_interval));
+            if (not loop->running) {
+                return;
+            }
+            loop->wakeup = false;
         }
-    }).detach();
+    });
+}
+
+void EnergyManagerImpl::stop() {
+    m_loop_state.handle()->running = false;
+    m_loop_state.notify_all();
+    if (m_mainloop.joinable()) {
+        m_mainloop.join();
+    }
 }
 
 void EnergyManagerImpl::on_energy_flow_request(const types::energy::EnergyFlowRequest& e) {
@@ -92,10 +521,22 @@ void EnergyManagerImpl::on_energy_flow_request(const types::energy::EnergyFlowRe
     energy_flow_request = e;
 
     if (is_priority_request(e)) {
-        // trigger optimization now
-        mainloop_sleep_condvar.notify_all();
+        m_loop_state.handle()->wakeup = true;
+        m_loop_state.notify_all();
     }
 }
+
+#ifdef BUILD_TESTING_MODULE_ENERGY_MANAGER
+ObservedMeasurement EnergyManagerImpl::get_observed_measurement(const std::string& uuid) {
+    std::scoped_lock lock(energy_mutex);
+
+    const auto it = contexts.find(uuid);
+    if (it == contexts.end()) {
+        return {};
+    }
+    return it->second.last_observed_measurement;
+}
+#endif
 
 std::vector<types::energy::EnforcedLimits>
 EnergyManagerImpl::run_optimizer(const types::energy::EnergyFlowRequest& request,
@@ -105,10 +546,25 @@ EnergyManagerImpl::run_optimizer(const types::energy::EnergyFlowRequest& request
     globals.init(start_time, config.schedule_interval_duration, config.schedule_total_duration, config.slice_ampere,
                  config.slice_watt, config.debug, request);
 
+    // Rebuilt every run, so a meter that left the tree stops contributing.
+    PowerMeterAggregator site_aggregator(std::chrono::seconds(config.power_meter_aggregation_window_s));
+    m_site_meter_source = collect_site_measurement(request, site_aggregator);
+    m_site_aggregate = site_aggregator.aggregate(globals.start_time);
+    warn_about_meter_timestamps(m_site_aggregate);
+
     time_probe optimizer_start;
     optimizer_start.start();
     if (globals.debug)
         EVLOG_info << "\033[1;44m---------------- Run energy optimizer ---------------- \033[1;0m";
+
+    if (globals.debug) {
+        const auto power = m_site_aggregate.power_W.has_value()
+                               ? fmt::format("{}W", m_site_aggregate.power_W.value().total)
+                               : std::string("no reading");
+        EVLOG_info << fmt::format("Site power: {} from {} ({} meter(s), {} stale)", power,
+                                  to_string(m_site_meter_source), m_site_aggregate.fresh_meters,
+                                  m_site_aggregate.stale_meters);
+    }
 
     time_probe market_tp;
 
@@ -125,18 +581,20 @@ EnergyManagerImpl::run_optimizer(const types::energy::EnergyFlowRequest& request
     for (auto m : evse_markets) {
         // Check if we need to clear the context
         // Note that context is created here if it does not exist implicitly by operator[] of the map
-        if (m->energy_flow_request.evse_state == types::energy::EvseState::Unplugged or
-            m->energy_flow_request.evse_state == types::energy::EvseState::Finished) {
+        if (not in_session(m->energy_flow_request)) {
             contexts[m->energy_flow_request.uuid].clear();
             contexts[m->energy_flow_request.uuid].ts_1ph_optimal =
                 globals.start_time - std::chrono::seconds(config.switch_3ph1ph_time_hysteresis_s);
         }
 
-        // FIXME: check for actual optimizer_targets and create correct broker for this evse
-        // For now always create simple FastCharging broker
-        brokers.push_back(std::make_shared<BrokerFastCharging>(*m, contexts[m->energy_flow_request.uuid],
-                                                               to_broker_fast_charging_config(config)));
+        brokers.push_back(
+            make_broker(broker_strategy, *m, contexts[m->energy_flow_request.uuid], to_broker_config(config)));
+        brokers.back()->observe();
         // EVLOG_info << fmt::format("Created broker for {}", m->energy_flow_request.uuid);
+    }
+
+    if (config.phase_symmetry_enabled and broker_strategy == BrokerStrategy::PowerRedistribution) {
+        apply_phase_imbalance_correction(brokers);
     }
 
     // for each evse: create a custom offer at their local market place and ask the broker to buy a slice.
@@ -153,7 +611,7 @@ EnergyManagerImpl::run_optimizer(const types::energy::EnergyFlowRequest& request
             //     create local offer at evse's marketplace
 
             offer_tp.start();
-            Offer local_offer(broker->get_local_market());
+            Offer local_offer(broker->get_local_market(), broker->trading_phases());
             offer_tp.pause();
 
             // ask broker to trade
@@ -191,21 +649,7 @@ EnergyManagerImpl::run_optimizer(const types::energy::EnergyFlowRequest& request
 
             l.schedule = sold_energy;
 
-            // select root limit from schedule based on globals.start_time
-            const auto* selected_schedule = &sold_energy.front();
-
-            for (const auto& s : sold_energy) {
-                const auto schedule_time = Everest::Date::from_rfc3339(s.timestamp);
-                if (globals.start_time < schedule_time) {
-                    // all further schedules will be further into the future
-                    break;
-                } else {
-                    // use this schedule as the starting point
-                    selected_schedule = &s;
-                }
-            }
-
-            l.limits_root_side = selected_schedule->limits_to_root;
+            l.limits_root_side = sold_energy[globals.active_slot].limits_to_root;
 
             if (globals.debug) {
                 EVLOG_info << "Sending enforced limits (import) to :" << l.uuid << " " << l.limits_root_side;
@@ -213,6 +657,10 @@ EnergyManagerImpl::run_optimizer(const types::energy::EnergyFlowRequest& request
 
             optimized_values.push_back(std::move(l));
         }
+    }
+
+    if (broker_strategy == BrokerStrategy::PowerRedistribution) {
+        infer_redistribution(market, brokers, optimized_values);
     }
 
     // Print out test case file

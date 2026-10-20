@@ -167,6 +167,7 @@ struct Conf {
     int dc_ramp_ampere_per_second;
     bool enable_nodered_interface;
     std::string phase_rotation_grid_side;
+    std::string phase_rotation_car_side;
     bool debug_emit_cp_state_hpav_frames;
     std::string debug_cp_state_hpav_device;
 

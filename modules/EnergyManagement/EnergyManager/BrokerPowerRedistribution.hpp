@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Pionix GmbH and Contributors to EVerest
+#pragma once
+
+#include <chrono>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "BrokerFastCharging.hpp"
+#include "PowerMeterAggregator.hpp"
+
+namespace module {
+
+// ---------------------------------------------------------------- power redistribution inference
+// Pure functions over one optimizer run. Only the increase side acts: each connector's share of
+// SiteInference::increase_W_by_connector is applied by its broker on the next run.
+
+/// \brief Import limit of the grid connection [W] at the slot in force: the lower of
+/// total_power_W and ac_max_current_A x declared phase count x nominal voltage, read from the
+/// root Market's resampled, efficiency corrected offer.
+/// \returns std::nullopt when the root has no import schedule at all
+std::optional<float> get_grid_limit_W(const Market& root, float nominal_ac_voltage);
+
+/// \brief Import power [W] an enforced limit hands to a connector, with the same precedence
+/// as get_grid_limit_W(). \p phases_drawn, the number of phases the connector draws on,
+/// scales it down where that is fewer than the limit declares. \returns std::nullopt when
+/// the limit carries neither watt nor ampere.
+std::optional<float> get_allocated_power_W(const types::energy::EnforcedLimits& limit, float nominal_ac_voltage,
+                                           std::optional<int> phases_drawn = std::nullopt);
+
+/// \brief The margin [W] the measurement based cap put on top of the connector's own
+/// measurement to arrive at \p limit, i.e. redistribution_margin_A on the phases that
+/// limit declares, or \p phases_drawn where fewer. 0 for a limit the cap is not expressed
+/// against (a watt-only DC node), where no such gap exists.
+float get_margin_power_W(const types::energy::EnforcedLimits& limit, float margin_A, float nominal_ac_voltage,
+                         std::optional<int> phases_drawn = std::nullopt);
+
+/// \brief Import bounds of a connector [W] at the slot in force, from its own Market offer
+/// for the same reasons as get_grid_limit_W().
+struct StaticBoundsW {
+    /// Smallest purchase that still charges: ac_min_current_A x min phase count x U.
+    std::optional<float> min_W;
+    /// The lower of total_power_W and ac_max_current_A x max phase count x U.
+    std::optional<float> max_W;
+};
+
+/// \p phases_drawn scales max_W as in get_allocated_power_W().
+StaticBoundsW get_static_bounds_W(const Market& connector, float nominal_ac_voltage,
+                                  std::optional<int> phases_drawn = std::nullopt);
+
+enum class ConnectorClass {
+    Unknown,        ///< no previous allocation or no measurement to compare against
+    UnderConsuming, ///< draws less than allotted by more than the margin: power can be reduced
+    Saturated,      ///< draws what it was allotted and could take more
+    AtMaximum,      ///< draws what it was allotted and is at its static maximum already
+};
+
+const char* to_string(ConnectorClass c);
+
+/// \brief Result of classify_connector() for one connector.
+struct ConnectorInference {
+    ConnectorClass connector_class{ConnectorClass::Unknown};
+    std::optional<float> allocated_W;
+    std::optional<float> measured_W;
+    /// By how much the allocation could shrink: down to measured x (1 + margin), but never
+    /// below the connector's minimum purchase. 0 unless UnderConsuming.
+    float reducible_W{0.f};
+    /// True once the condition has held for the configured hold time. Set by the caller
+    /// from its HoldLatch, which owns the timing; classify_connector() leaves it false.
+    bool held{false};
+};
+
+/// \brief Compares allotted with drawn power. A gap above \p margin x allocation, floored at the
+/// cap's own \p broker_margin_W, is under-consumption; a smaller gap is Saturated, or AtMaximum
+/// at the static limit (within 1 W). Unknown without both values or with an export measurement.
+ConnectorInference classify_connector(std::optional<float> allocated_W, std::optional<float> measured_W,
+                                      const StaticBoundsW& bounds, float margin, float broker_margin_W);
+
+/// \brief A connector that could take more power: its current allocation and static maximum.
+/// A connector with an unknown maximum is not a candidate.
+struct SaturatedConnector {
+    std::string uuid;
+    float allocated_W;
+    float max_W;
+};
+
+/// \brief Pairs a Saturated classification with its bounds, when both are known.
+///
+/// \returns std::nullopt when the allocation or the static maximum is missing
+std::optional<SaturatedConnector> to_saturated_connector(const std::string& uuid, const ConnectorInference& connector,
+                                                         const StaticBoundsW& bounds);
+
+/// \brief Result of infer_site().
+struct SiteInference {
+    std::optional<float> grid_limit_W;
+    /// Fresh site aggregate. nullopt when no meter is fresh or any meter is stale: a partial
+    /// sum undercounts consumption and would fabricate headroom.
+    std::optional<float> measured_W;
+    /// grid_limit_W - measured_W, when both are known
+    std::optional<float> headroom_W;
+    int saturated_connectors{0};
+    /// Which meter measured_W came from; a leaf sum sees only the EVSEs.
+    SiteMeterSource meter_source{SiteMeterSource::None};
+    /// Proposed increase [W] summed over the saturated connectors. 0 when the headroom is
+    /// within the deadband, no connector can take more, or the gain is 0.
+    float increase_W{0.f};
+    /// The same increase per connector; only connectors granted more than 0 W appear.
+    std::map<std::string, float> increase_W_by_connector;
+    /// True once the condition has held for the configured hold time (set by the caller
+    /// from its HoldLatch).
+    bool held{false};
+};
+
+/// \brief Proportional increase law for the site.
+///
+/// Headroom h = G - S must exceed the deadband margin x G. The increase is then
+/// gain x (h - deadband), split equally over the saturated connectors and clamped per
+/// connector to its static maximum, so the step shrinks as the grid limit comes closer.
+SiteInference infer_site(std::optional<float> grid_limit_W, const PowerMeterAggregator::AggregateResult& aggregate,
+                         const std::vector<SaturatedConnector>& saturated, float margin, float gain);
+
+// ---------------------------------------------------------------- measurement extraction
+
+/// \brief Measurement of one node, from a single reading so no value carries another meter's
+/// timestamp. The reading with power wins, leaves side before root side, then current.
+/// measured_at stays empty without a parsable timestamp: the last reading is republished on
+/// every request, so only its own timestamp reveals a frozen meter.
+/// \returns all fields std::nullopt if the node carries none
+ObservedMeasurement read_measurement(const types::energy::EnergyFlowRequest& node);
+
+/// \brief Per-phase current: measured current, else per-phase power / \p nominal_ac_voltage,
+/// else total power over \p active_phases (pass 1 when unknown, the least restrictive).
+/// \returns all phases std::nullopt when no current can be derived
+PhaseCurrents measured_phase_currents(const ObservedMeasurement& measurement, float nominal_ac_voltage,
+                                      int active_phases);
+
+/// \brief True while \p measurement has a value and is_fresh() accepts its timestamp.
+///
+/// \param max_age zero accepts any age
+bool measurement_can_limit(const ObservedMeasurement& measurement, date::utc_clock::time_point now,
+                           std::chrono::seconds max_age);
+
+/// \brief The single ac_max_current_A applied to every phase: the highest known phase, so
+/// the phase that draws most is not starved. std::nullopt when no phase is known.
+std::optional<float> to_scalar_cap(const PhaseCurrents& cap);
+
+/// \brief Trades like BrokerFastCharging, but caps a charging connector at its measured current
+/// plus a margin plus BrokerContext::distributed_power_W, its share of the site headroom. The cap
+/// lowers only the slot covering now, never below the minimum current; reductions wait out the
+/// hold. Without a fresh measurement the cap is the minimum plus the margin. DC is not capped.
+class BrokerPowerRedistribution : public BrokerFastCharging {
+public:
+    BrokerPowerRedistribution(Market& market, BrokerContext& context, EnergyManagerConfig config);
+
+    /// \brief Reads the connector's measurement into the broker context and decides the cap
+    /// for this run.
+    void observe() override;
+
+    PhaseSet trading_phases() const override {
+        return context.phases_in_use;
+    }
+
+    /// \brief Narrows the offer to the cap decided by observe(), then trades like
+    /// BrokerFastCharging.
+    void tradeImpl() override;
+
+private:
+    void track_phases_in_use();
+    void decide_cap(const types::energy::EnergyFlowRequest& request);
+    void limit_offer_to_cap();
+    float sold_current_A(int slot) const;
+
+    // A broker lives for one run; state that must outlive it is in BrokerContext.
+    std::optional<PhaseCurrents> m_run_cap_A;
+    std::string m_run_cap_source;
+};
+
+} // namespace module
