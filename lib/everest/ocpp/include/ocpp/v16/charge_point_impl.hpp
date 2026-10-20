@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 - 2026 Pionix GmbH and Contributors to EVerest
+// Copyright Pionix GmbH and Contributors to EVerest
 #ifndef OCPP_V16_CHARGE_POINT_IMPL_HPP
 #define OCPP_V16_CHARGE_POINT_IMPL_HPP
 #include "ocpp/v16/ocpp_enums.hpp"
@@ -15,6 +15,7 @@
 #include <set>
 
 #include <everest/timer.hpp>
+#include <everest/util/async/monitor.hpp>
 
 #include <ocpp/common/aligned_timer.hpp>
 #include <ocpp/common/charging_station_base.hpp>
@@ -94,10 +95,16 @@ private:
     BootReasonEnum bootreason{BootReasonEnum::PowerUp};
     bool initialized{false};
     bool InvalidCSMSCertificate_logged{false};
-    ChargePointConnectionState connection_state{ChargePointConnectionState::Disconnected};
+    std::atomic<ChargePointConnectionState> connection_state{ChargePointConnectionState::Disconnected};
     std::atomic<RegistrationStatus> registration_status{RegistrationStatus::Pending};
     DiagnosticsStatus diagnostics_status{DiagnosticsStatus::Idle};
     FirmwareStatus firmware_status{FirmwareStatus::Idle};
+    struct PendingFirmwareStatus {
+        std::int32_t request_id;
+        FirmwareStatusNotification status;
+        bool disable_connectors_during_install;
+    };
+    everest::lib::util::monitor<std::optional<PendingFirmwareStatus>> pending_firmware_status;
     UploadLogStatusEnumType log_status{UploadLogStatusEnumType::Idle};
 
     std::string message_log_path;
@@ -146,6 +153,7 @@ private:
     std::mutex data_transfer_callbacks_mutex;
     std::map<CiString<50>, std::function<void(const KeyValue& key_value)>> configuration_key_changed_callbacks;
     std::function<void(const KeyValue& key_value)> generic_configuration_key_changed_callback;
+    std::function<bool(const std::string& key, const std::string& value)> custom_key_validation_callback;
 
     std::mutex stop_transaction_mutex;
     std::condition_variable stop_transaction_cv;
@@ -263,6 +271,8 @@ private:
                                       bool disable_connectors_during_install = true);
     void log_status_notification(UploadLogStatusEnumType status, int requestId,
                                  bool initiated_by_trigger_message = false);
+    void send_firmware_update_status_notification(const PendingFirmwareStatus& status);
+    void reset_firmware_status_if_finished(std::int32_t request_id, FirmwareStatusNotification status);
     void signed_firmware_update_status_notification(FirmwareStatusEnumType status, int requestId,
                                                     bool initiated_by_trigger_message = false,
                                                     bool disable_connectors_during_install = true);
@@ -967,6 +977,20 @@ public:
     void
     register_generic_configuration_key_changed_callback(const std::function<void(const KeyValue& key_value)>& callback);
 
+    /// \brief registers a \p callback that can veto a ChangeConfiguration before it is applied (e.g.
+    /// based on runtime charge-point state), for both Core and Custom-profile keys. Invoked from
+    /// set_configuration_key_internal, so it applies regardless of which ChargePointConfigurationInterface
+    /// implementation is in use.
+    /// \param callback returns true to allow the change, false to reject it
+    void register_custom_key_validation_callback(
+        const std::function<bool(const std::string& key, const std::string& value)>& callback);
+
+    /// \brief force-writes a Custom key's value, bypassing its readOnly flag (see
+    /// ChargePointConfigurationInterface::set_custom_key_forced for details)
+    /// \param key
+    /// \param value
+    ConfigurationStatus set_custom_key_forced(const CiString<50>& key, const CiString<500>& value);
+
     /// \brief registers a \p callback function that can be used to react to a security event callback. This callback is
     /// called only if the SecurityEvent occured internally within libocpp
     void register_security_event_callback(
@@ -995,7 +1019,9 @@ public:
     /// \return a response containing the requested key(s) including the values and unkown keys if present
     GetConfigurationResponse get_configuration_key(const GetConfigurationRequest& request);
 
-    /// \brief Sets a configuration key
+    /// \brief Sets a configuration key on behalf of a local caller
+    /// \note Unlike a ChangeConfiguration.req from the CSMS, this also writes ReadOnly keys. Keys whose value the
+    /// stack derives itself are still rejected.
     /// \param key
     /// \param value
     /// \return Indicates the result of the operation

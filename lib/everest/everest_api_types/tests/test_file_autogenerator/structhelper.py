@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2020 - 2025 Pionix GmbH and Contributors to EVerest
+# Copyright Pionix GmbH and Contributors to EVerest
 
 import re
 
@@ -21,7 +21,7 @@ class StructHelper(Helper):
     # so a struct field like `std::optional<std::string> tstamp{};` still matches
     # and does not silently drop its whole struct from test generation).
     default_value = r"\{[A-Za-z:_<>0-9\.]*\}?"
-    regex_single_field = r"([A-Za-z:_<>0-9]+" + w + Helper.regex_field_or_class_name + \
+    regex_single_field = r"((?:[A-Za-z:_<>0-9]+" + w + r")+" + Helper.regex_field_or_class_name + \
         r"(" + default_value + r")?" + r";)" + w
     regex_fields = r"(" + w + regex_single_field + r")*"
 
@@ -58,8 +58,10 @@ class StructHelper(Helper):
         for field in self.get_fields():
             if ("std::optional" not in field) == mandatory:
                 split = re.split(Helper.regex_whitespaces, field)
-                assert split.__len__() == 2
-                a.append((split[0], split[1]))
+                assert len(split) >= 2
+                type_string = " ".join(split[:-1])
+                field_name = split[-1]
+                a.append((type_string, field_name))
         return a
 
     def get_fields_optional(self):
@@ -94,7 +96,7 @@ class StructHelper(Helper):
             return code + ");\n"
         token = "generated_object"
         code += ") {\n"
-        code += "    (void)seed;  // May be unused depending on field types; silences the compiler warning when so;\n"
+        code += "    (void)seed;  // May be unused depending on field types; silences the compiler warning in that case;\n"
         code += "    thread_local static int depth = 0;\n"
         code += "    depth++;\n"
         code += "    " + self.get_type() + " " + token + "{};\n"
@@ -131,9 +133,12 @@ class StructHelper(Helper):
 
     def generate_test_fields(self, fields, is_optional):
         code = ""
-        for i in fields:
-            code += self.value_generator.generate_corresponding_field_test(
-                i[1], i[0], self.get_namespace(), is_optional)
+        for field in fields:
+            try:
+                code += self.value_generator.generate_corresponding_field_test(
+                    field[1], field[0], self.get_namespace(), is_optional)
+            except TypeError as e:
+                raise TypeError(169*"/" + f"\n'{self.get_type_with_namespace()}::{field[1]}': {e}\n" + 180*"\\") from e
         return code
 
     def generate_test(self):

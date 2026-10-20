@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 - 2026 Pionix GmbH and Contributors to EVerest
+// Copyright Pionix GmbH and Contributors to EVerest
 
 #include <algorithm>
 #include <atomic>
@@ -13,7 +13,7 @@
 #include <utility>
 
 #include <date/date.h>
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <utils/date.hpp>
 
 #include "everest/logging.hpp"
@@ -212,6 +212,11 @@ void warn_if_comm_retry_delay_exceeds_reboot_budget(int retry_count, int retry_d
 } // namespace
 
 powermeterImpl::~powermeterImpl() {
+    shutdown();
+}
+
+void powermeterImpl::shutdown() {
+    // idempotent, so it does not matter whether the framework got here first or the destructor did
     stop_requested_.store(true);
     stop_cv_.notify_all();
     if (live_measure_thread_.joinable()) {
@@ -544,9 +549,11 @@ void powermeterImpl::ready() {
     live_measure_thread_ = std::thread([this] {
         std::atomic_bool device_not_configured = true;
         auto last_state_read = std::chrono::steady_clock::time_point{};
+        const auto measurement_interval = std::chrono::milliseconds{config.live_measurement_interval_ms};
+        const auto state_read_interval = std::chrono::milliseconds{config.device_state_read_interval_ms};
+        auto last_interval_overrun_warning = std::chrono::steady_clock::time_point{};
         while (!stop_requested_.load()) {
-            const auto measurement_interval = std::chrono::milliseconds{config.live_measurement_interval_ms};
-            const auto state_read_interval = std::chrono::milliseconds{config.device_state_read_interval_ms};
+            const auto measurement_start = std::chrono::steady_clock::now();
             try {
                 if (device_not_configured.load()) {
                     configure_device();
@@ -578,10 +585,27 @@ void powermeterImpl::ready() {
                     stop_cv_.wait_for(lock, std::chrono::seconds{config.communication_error_pause_delay_s},
                                       [this] { return stop_requested_.load(); });
                 }
+                continue;
             }
             {
-                std::unique_lock<std::mutex> lock(stop_mutex_);
-                stop_cv_.wait_for(lock, measurement_interval, [this] { return stop_requested_.load(); });
+                const auto now = std::chrono::steady_clock::now();
+                // remaining time until the next measurement is due
+                auto time_to_wait = measurement_interval - (now - measurement_start);
+                if (time_to_wait > std::chrono::milliseconds{0}) {
+                    last_interval_overrun_warning = std::chrono::steady_clock::time_point{};
+                    std::unique_lock<std::mutex> lock(stop_mutex_);
+                    stop_cv_.wait_for(lock, time_to_wait, [this] { return stop_requested_.load(); });
+                } else {
+                    if (last_interval_overrun_warning == std::chrono::steady_clock::time_point{} ||
+                        (now - last_interval_overrun_warning) >= std::chrono::seconds{60}) {
+                        last_interval_overrun_warning = now;
+                        EVLOG_warning
+                            << "Measurement took longer than configured interval " << measurement_interval.count()
+                            << "ms, consider increasing interval or baudrate. Last measurement took "
+                            << std::chrono::duration_cast<std::chrono::milliseconds>(now - measurement_start).count()
+                            << "ms";
+                    }
+                }
             }
         }
     });

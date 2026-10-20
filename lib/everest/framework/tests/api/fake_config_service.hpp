@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 - 2026 Pionix GmbH and Contributors to EVerest
+// Copyright Pionix GmbH and Contributors to EVerest
 
 #pragma once
 
@@ -128,8 +128,10 @@ struct FakeConfigService : public ::Everest::config::ConfigServiceInterface {
     void register_active_slot_update_handler(std::function<void(const ActiveSlotUpdate&)> handler) override {
         active_slot_handler = std::move(handler);
     }
-    void register_config_update_handler(std::function<void(const ConfigurationUpdate&)> handler) override {
+    std::function<void()>
+    register_config_update_handler(std::function<void(const ConfigurationUpdate&)> handler) override {
         config_update_handler = std::move(handler);
+        return [this]() { config_update_handler = nullptr; };
     }
 
     // --- module state ---

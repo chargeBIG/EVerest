@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 - 2026 Pionix GmbH and Contributors to EVerest
+// Copyright Pionix GmbH and Contributors to EVerest
 
 #include <everest_api_module_helpers/ValidatingMqttProxy.hpp>
 
@@ -18,7 +18,7 @@ void ValidatingMqttProxy::publish(const std::string& topic, const std::string& d
     if (is_topic_valid(topic)) {
         provider.publish(topic, data);
     } else {
-        EVLOG_warning << "ValidatingMqttProxy: Droped '" << data << "' as topic '" << topic << "' invalid";
+        EVLOG_warning << "ValidatingMqttProxy: Dropped data as topic '" << topic << "' is invalid";
     }
 }
 
@@ -26,7 +26,7 @@ void ValidatingMqttProxy::publish(const std::string& topic, bool data) {
     if (is_topic_valid(topic)) {
         provider.publish(topic, data);
     } else {
-        EVLOG_warning << "ValidatingMqttProxy: Droped '" << data << "' as topic '" << topic << "' invalid";
+        EVLOG_warning << "ValidatingMqttProxy: Dropped data as topic '" << topic << "' is invalid";
     }
 }
 

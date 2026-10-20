@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 - 2026 Pionix GmbH and Contributors to EVerest
+// Copyright Pionix GmbH and Contributors to EVerest
 
 #pragma once
 
@@ -18,10 +18,10 @@
 #include <everest/logging.hpp>
 #include <utils/mqtt_config_service.hpp>
 
+#include <everest_api_module_helpers/CommCheckHandler.hpp>
 #include <everest_api_module_helpers/ValidatingMqttProxy.hpp>
 #include <everest_api_types/entrypoint/API.hpp>
 #include <everest_api_types/generic/codec.hpp>
-#include <everest_api_types/utilities/CommCheckHandler.hpp>
 #include <everest_api_types/utilities/MqttProviderInterface.hpp>
 #include <everest_api_types/utilities/Topics.hpp>
 #include <everest_api_types/utilities/codec.hpp>

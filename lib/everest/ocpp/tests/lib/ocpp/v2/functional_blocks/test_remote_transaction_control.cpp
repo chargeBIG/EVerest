@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Pionix GmbH and Contributors to EVerest
 
+#include <firmware_update_mock.hpp>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -66,6 +67,7 @@ public:
     MOCK_METHOD(std::optional<StatusInfo>, is_sign_certificate_possible, (const ocpp::CertificateSigningUseEnum&),
                 (const, override));
     MOCK_METHOD(void, stop_certificate_signed_timer, (), (override));
+    MOCK_METHOD(bool, v2g20_certificate_installation_enabled, (), (const, override));
     MOCK_METHOD(void, init_certificate_expiration_check_timers, (), (override));
     MOCK_METHOD(void, stop_certificate_expiration_check_timers, (), (override));
     MOCK_METHOD(Get15118EVCertificateResponse, on_get_15118_ev_certificate_request,
@@ -93,15 +95,6 @@ public:
                 (override));
     MOCK_METHOD(void, set_remote_start_id_for_evse, (std::int32_t, IdToken, std::int32_t), (override));
     MOCK_METHOD(void, schedule_reset, (std::optional<std::int32_t>), (override));
-};
-
-class FirmwareUpdateMock : public FirmwareUpdateInterface {
-public:
-    MOCK_METHOD(void, handle_message, (const ocpp::EnhancedMessage<MessageType>&), (override));
-    MOCK_METHOD(void, on_firmware_update_status_notification, (std::int32_t, const FirmwareStatusEnum&, const bool),
-                (override));
-    MOCK_METHOD(void, on_firmware_status_notification_request, (), (override));
-    MOCK_METHOD(void, on_transaction_finished, (), (override));
 };
 
 class ProvisioningMock : public ProvisioningInterface {
@@ -175,7 +168,7 @@ protected: // Functions
         connector_evse_1(1, 1, component_state_manager),
         connector_evse_2(2, 1, component_state_manager),
         remote_transaction_control(std::make_unique<RemoteTransactionControl>(
-            functional_block_context, transaction, smart_charging, meter_values, availability, firmware_update,
+            functional_block_context, transaction, &smart_charging, meter_values, availability, firmware_update,
             security, nullptr, provisioning, unlock_connector_callback.AsStdFunction(),
             remote_start_transaction_callback.AsStdFunction(), stop_transaction_callback.AsStdFunction(),
             registration_status, upload_log_status, upload_log_status_id)) {
@@ -346,6 +339,21 @@ TEST_F(RemoteTransactionControlTest, RemoteStartWithoutEvseIdAcceptedWithProfile
     remote_transaction_control->handle_message(create_remote_start_request(std::nullopt, create_tx_profile()));
 }
 
+TEST_F(RemoteTransactionControlTest, RemoteStartWithProfileIgnoresProfileWhenSmartChargingUnavailable) {
+    // SmartChargingCtrlr.Available=false: the charge point builds no smart charging block.
+    remote_transaction_control = std::make_unique<RemoteTransactionControl>(
+        functional_block_context, transaction, nullptr, meter_values, availability, firmware_update, security, nullptr,
+        provisioning, unlock_connector_callback.AsStdFunction(), remote_start_transaction_callback.AsStdFunction(),
+        stop_transaction_callback.AsStdFunction(), registration_status, upload_log_status, upload_log_status_id);
+    set_smart_charging_enabled(true);
+
+    EXPECT_CALL(transaction, set_remote_start_id_for_evse(1, _, 123));
+    EXPECT_CALL(remote_start_transaction_callback, Call(_, _)).WillOnce(Return(RequestStartStopStatusEnum::Accepted));
+    expect_response_status(RequestStartStopStatusEnum::Accepted);
+
+    remote_transaction_control->handle_message(create_remote_start_request(1, create_tx_profile()));
+}
+
 TEST_F(RemoteTransactionControlTest, RemoteStartWithEvseIdAcceptedForSpecificEvse) {
     // Regression test for the existing path: with an evse id, the remote start id is registered for
     // that specific evse.
@@ -405,6 +413,44 @@ TEST_F(RemoteTransactionControlTest, TriggerSignV2GCertificateRejectedWhenInstal
     expect_trigger_message_rejection("NotEnabled");
 
     remote_transaction_control->handle_message(create_trigger_message_request(MessageTriggerEnum::SignV2GCertificate));
+}
+
+TEST_F(RemoteTransactionControlTest, TriggerSignV2G20CertificateRejectedWhenNotOcpp21) {
+    // V2GCertificateInstallationEnabled alone is not enough for the ISO 15118-20 leaf: the security block also
+    // requires an OCPP 2.1 connection.
+    set_v2g_certificate_installation_enabled(true);
+    EXPECT_CALL(security, v2g20_certificate_installation_enabled()).WillOnce(Return(false));
+
+    EXPECT_CALL(security, is_sign_certificate_possible(_)).Times(0);
+    EXPECT_CALL(security, sign_certificate_req(_, _)).Times(0);
+    expect_trigger_message_rejection("NotSupported");
+
+    remote_transaction_control->handle_message(
+        create_trigger_message_request(MessageTriggerEnum::SignV2G20Certificate));
+}
+
+TEST_F(RemoteTransactionControlTest, TriggerSignV2G20CertificateRejectedWhenV2GInstallationDisabled) {
+    set_v2g_certificate_installation_enabled(false);
+
+    EXPECT_CALL(security, v2g20_certificate_installation_enabled()).Times(0);
+    EXPECT_CALL(security, sign_certificate_req(_, _)).Times(0);
+    expect_trigger_message_rejection("NotEnabled");
+
+    remote_transaction_control->handle_message(
+        create_trigger_message_request(MessageTriggerEnum::SignV2G20Certificate));
+}
+
+TEST_F(RemoteTransactionControlTest, TriggerSignV2G20CertificateAcceptedWhenEnabledAndCanSend) {
+    set_v2g_certificate_installation_enabled(true);
+    EXPECT_CALL(security, v2g20_certificate_installation_enabled()).WillOnce(Return(true));
+
+    EXPECT_CALL(security, is_sign_certificate_possible(ocpp::CertificateSigningUseEnum::V2G20Certificate))
+        .WillOnce(Return(std::nullopt));
+    EXPECT_CALL(security, sign_certificate_req(ocpp::CertificateSigningUseEnum::V2G20Certificate, true));
+    expect_trigger_message_status(TriggerMessageStatusEnum::Accepted);
+
+    remote_transaction_control->handle_message(
+        create_trigger_message_request(MessageTriggerEnum::SignV2G20Certificate));
 }
 
 TEST_F(RemoteTransactionControlTest, TriggerSignV2GCertificateAcceptedWhenEnabledAndCanSend) {

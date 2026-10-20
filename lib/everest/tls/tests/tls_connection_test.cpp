@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2024 Pionix GmbH and Contributors to EVerest
+// Copyright Pionix GmbH and Contributors to EVerest
 
 #include "tls_connection_test.hpp"
 
 #include <arpa/inet.h>
 #include <condition_variable>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <netdb.h>
@@ -49,7 +50,8 @@ tls::Server::OptionalConfig ssl_init() {
     ref.trust_anchor_file = "server_root_cert.pem";
     ref.ocsp_response_files = {"ocsp_response.der", "ocsp_response.der"};
     server_config->host = "127.0.0.1";
-    server_config->service = "8444";
+    // update() does not change the listen socket, so this is never bound
+    server_config->service = "0";
     server_config->ipv6_only = false;
     server_config->verify_client = false;
     server_config->io_timeout_ms = 500;
@@ -69,6 +71,14 @@ TEST_F(TlsTest, StartStop) {
     if (server_thread.joinable()) {
         server_thread.join();
     }
+}
+
+TEST_F(TlsTest, BoundPortReportsEphemeralPort) {
+    // Without this the fixture cannot tell the client where to connect, since
+    // the OS picks the port.
+    EXPECT_EQ(server.bound_port(), 0); // nothing bound yet
+    start();
+    EXPECT_NE(server.bound_port(), 0);
 }
 
 TEST_F(TlsTest, StartConnectDisconnect) {
@@ -609,6 +619,29 @@ TEST_F(TlsTest, TLS13) {
     EXPECT_TRUE(is_reset(flags_t::status_request_v2));
 }
 
+TEST_F(TlsTest, UnloadableOcspResponseDoesNotPreventTls) {
+    // a cached OCSP response that is not DER (stale, corrupt, or written in
+    // another encoding) loses only its certificate's staple; the server still
+    // comes up and serves the chain
+    {
+        std::ofstream garbage("garbage_ocsp_response.der");
+        garbage << "not a DER encoded OCSP response";
+    }
+    server_config.chains[0].ocsp_response_files = {"garbage_ocsp_response.der", "ocsp_response.der"};
+    client_config.status_request = true;
+
+    ASSERT_EQ(server.init(server_config, nullptr), tls::Server::state_t::init_complete);
+    server_thread = std::thread(&run_server, std::ref(server));
+    server.wait_running();
+
+    connect();
+    EXPECT_TRUE(is_set(flags_t::connected));
+    EXPECT_TRUE(is_set(flags_t::status_request_cb));
+    // the leaf's response is the unloadable one, so nothing is stapled
+    EXPECT_TRUE(is_reset(flags_t::status_request));
+    EXPECT_TRUE(is_reset(flags_t::status_request_v2));
+}
+
 TEST_F(TlsTest, NoOcspFiles) {
     // test using TLS 1.2
     for (auto& chain : server_config.chains) {
@@ -872,7 +905,7 @@ TEST_F(TlsTest, TCKeysInvalid) {
     client.reset();
     // localhost works in some cases but not in the CI pipeline for IPv6
     // use ip6-localhost
-    auto connection = client.connect("127.0.0.1", "8444", false, 1000);
+    auto connection = client.connect("127.0.0.1", server_service().c_str(), false, 1000);
     if (connection) {
         if (connection->connect() == result_t::success) {
             set(ClientTest::flags_t::connected);

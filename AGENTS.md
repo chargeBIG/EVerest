@@ -59,6 +59,28 @@ heavy ones with `-DEVEREST_EXCLUDE_MODULES="EvseSlac;EvseV2G;IsoMux"`, quoting t
 list. `cmake -LH build` lists all options; the two easiest to miss are
 `EVEREST_ENABLE_COVERAGE` and `CMAKE_RUN_CLANG_TIDY`, both OFF.
 
+Rust modules (`modules/**/Rs*`) build only with `-DEVEREST_ENABLE_RS_SUPPORT=ON`. CMake
+assembles a cargo workspace in `build/rust_workspace` and runs cargo there, in release
+profile for every build type but Debug. Cross builds set `EVEREST_RS_TARGET_TRIPLE` and
+`EVEREST_RS_LINKER`; the defaults are `<CMAKE_SYSTEM_PROCESSOR>-unknown-linux-gnu` and
+`CMAKE_CXX_COMPILER`. `modules/Cargo.lock` pins the crates for Bazel and Yocto alike:
+after editing a Rust module's `Cargo.toml`, update it (`cargo update` in `modules/`),
+regenerate `yocto/meta-everest-common/recipes-core/everest/everest-core-crates.inc`
+with `bitbake -c update_crates everest-core`, and mirror a new zvt revision in the
+`SRCREV` of `everest-core-rust.inc` next to it. `bazel test //yocto:rust_pins_test` checks
+that manifests, lock file and recipe name the same revision.
+
+The Yocto layers `yocto/<release>/meta-everest` build everest-core from this tree. Recipes
+and classes they share live in the layer `yocto/meta-everest-common`, which a
+meta-everest layer adds itself unless `bblayers.conf` lists it (an extensible SDK's does);
+a meta-everest layer keeps only its backports and release-specific recipes. Shared recipes
+refer to `${UNPACKDIR}`, never `${WORKDIR}`, and fetch git sources with
+`;destsuffix=${BP}` and no `S` of their own (wrynose rejects `S = "${UNPACKDIR}/git"`);
+kirkstone and scarthgap default `UNPACKDIR` to `${WORKDIR}` in their `layer.conf`.
+The `rust` PACKAGECONFIG needs Rust 1.86 or newer, on kirkstone
+and scarthgap the meta-lts-mixins `<release>/rust` layer, see
+`docs/source/explanation/linux-yocto/building-yocto.rst`.
+
 ## Running
 
 Generated run scripts are the simplest entry point:
@@ -104,13 +126,21 @@ in case and spelling. List with `ctest -N` first. Coverage needs
 `-DEVEREST_ENABLE_COVERAGE=ON`; the `everest-core_create_coverage` target writes
 `build/everest-core_create_coverage/index.html`.
 
+CI runs the unit tests in parallel (`ctest -j "$(nproc)"` in
+`.ci/build-kit/scripts/run_unit_tests.sh`), so a test must not depend on running alone.
+Prefer port 0 and per-test temporary directories. Tests that share a fixed resource (a
+port, a file path, a PKI or database directory) get a common `RESOURCE_LOCK`, as the libtls
+and io TLS tests do with `tls_pki`; a test that must not run next to any other gets
+`RUN_SERIAL`, as the iso15118 tests on the fixed port 50000 do. With
+`catch_discover_tests` or `gtest_discover_tests`, set them through `PROPERTIES` so they
+apply to every discovered test. Check new tests with `ctest -j` locally.
+
 Integration tests use pytest through the unified runner `tests/run-tests.sh`, against a
 built and installed prefix. The runner installs the OCPP certificate and component-config
 fixtures itself but not the venv, so activate `build/venv` first:
 
 ```bash
 . build/venv/bin/activate
-cmake --build build --target install_everest_testing
 ./tests/run-tests.sh core            # suites: all, integration, core, framework,
                                      # asyncapi, ocpp, ocpp16, ocpp201, ocpp21, eebus
 ./tests/run-tests.sh ocpp201 -k authorization   # -k filters; -- passes args to pytest
@@ -242,9 +272,15 @@ often:
 
 - Sign off every commit (`Signed-off-by`, DCO), enforced by
   `.github/workflows/job_dco-check.yaml`.
-- New files need copyright and license headers.
-- Files you modify get their copyright end year bumped to the current year: `2020 - 2025`
-  becomes `2020 - 2026`, a single `2023` becomes `2023 - 2026`. Never write `2026 - 2026`.
+- New files need copyright and license headers, without years:
+
+  ```cpp
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright Pionix GmbH and Contributors to EVerest
+  ```
+
+  Never add or bump years in existing notices, and never modify notices of other
+  copyright holders or of third-party code.
 - While review is open, do not rebase or force-push, so reviewers can see that feedback
   was addressed. Squashing to a single commit once approved is how changes land.
 - Every contribution must be reviewed and understood by a human before submission.

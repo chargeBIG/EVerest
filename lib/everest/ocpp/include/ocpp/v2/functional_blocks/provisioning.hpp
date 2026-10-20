@@ -15,6 +15,7 @@ class MeterValuesInterface;
 class DiagnosticsInterface;
 class TransactionInterface;
 class TariffAndCostInterface;
+class FirmwareUpdateInterface;
 
 struct BootNotificationResponse;
 struct SetVariablesRequest;
@@ -73,7 +74,8 @@ public:
                  IsResetAllowedCallback is_reset_allowed_callback, ResetCallback reset_callback,
                  StopTransactionCallback stop_transaction_callback,
                  std::optional<VariableChangedCallback> variable_changed_callback,
-                 TariffAndCostInterface& tariff_and_cost, std::atomic<RegistrationStatusEnum>& registration_status);
+                 TariffAndCostInterface& tariff_and_cost, std::atomic<RegistrationStatusEnum>& registration_status,
+                 FirmwareUpdateInterface& firmware_update);
     void handle_message(const ocpp::EnhancedMessage<MessageType>& message) override;
     void boot_notification_req(const BootReasonEnum& reason, const bool initiated_by_trigger_message = false) override;
     void stop_bootnotification_timer() override;
@@ -94,6 +96,7 @@ private:
     DiagnosticsInterface& diagnostics;
     TransactionInterface& transaction;
     TariffAndCostInterface& tariff_and_cost;
+    FirmwareUpdateInterface& firmware_update;
 
     std::optional<TimeSyncCallback> time_sync_callback;
     std::optional<BootNotificationCallback> boot_notification_callback;
@@ -136,10 +139,15 @@ private:
                                                                        const ComponentVariable& cv);
     std::optional<std::string> validate_network_configuration_priority(const SetVariableData& set_variable_data);
 
-    /// \brief Validate URL scheme / security profile / certificate consistency for a single network profile
+    /// \brief Check that a network profile's URL scheme matches its security profile
     /// \return std::nullopt if valid, or a reason code string if rejected
-    std::optional<std::string> validate_network_connection_profile(int32_t configuration_slot,
-                                                                   const NetworkConnectionProfile& profile);
+    std::optional<std::string> validate_network_profile_content(int32_t configuration_slot,
+                                                                const NetworkConnectionProfile& profile);
+
+    /// \brief Validate certificate preconditions for a priority slot above the active security profile
+    /// \return std::nullopt if valid, or a reason code string if rejected
+    std::optional<std::string> validate_network_profile_security_preconditions(int32_t configuration_slot,
+                                                                               const NetworkConnectionProfile& profile);
 
     /// \brief B09.FR.26/27: Clear the given NetworkConfiguration variable on the currently active slot
     /// so subsequent reads fall back to the SecurityCtrlr global per B09.FR.16. Does nothing if no slot

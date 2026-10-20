@@ -7,7 +7,7 @@
 #include <cstring>
 
 #include <everest/io/event/fd_event_handler.hpp>
-#include <fmt/core.h>
+#include <fmt/format.h>
 
 #include "everest/logging.hpp"
 
@@ -239,6 +239,15 @@ void slacImpl::handle_enter_bcd() {
 
 void slacImpl::handle_leave_bcd() {
     post_command("leave_bcd", [](datalink_controller& target) { target.post_leave_bcd(); });
+}
+
+void slacImpl::handle_count_bc(int& count) {
+    // The B/C transition count exists for the HomePlug CM_VALIDATE BCB-toggle exchange, which
+    // matches a vehicle by counting pilot toggles when the modems cannot tell each other apart.
+    // MCS matches over the SPE link instead and has no CM_VALIDATE, so the count has no consumer
+    // here. Accepted and ignored: EvseManager pushes it on every edge for whichever slac provider
+    // is configured, and refusing it would make an ordinary session log errors.
+    (void)count;
 }
 
 void slacImpl::handle_dlink_terminate() {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 - 2023 Pionix GmbH and Contributors to EVerest
+// Copyright Pionix GmbH and Contributors to EVerest
 #include <random>
 
 #include <everest/logging.hpp>
@@ -164,8 +164,6 @@ std::optional<std::string> WebsocketBase::getAuthorizationHeader() {
 
         // TODO (ioan): replace with libevse-security usage
         auth_header.emplace(std::string("Basic ") + ocpp::base64_encode(plain_auth_header));
-
-        EVLOG_debug << "Basic Auth header: " << auth_header.value();
     }
 
     return auth_header;

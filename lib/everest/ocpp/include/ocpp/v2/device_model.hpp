@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 - 2023 Pionix GmbH and Contributors to EVerest
+// Copyright Pionix GmbH and Contributors to EVerest
 
 #ifndef DEVICE_MODEL_HPP
 #define DEVICE_MODEL_HPP
@@ -52,10 +52,11 @@ private:
     /// \param attribute_enum
     /// \param value string reference to value: will be set to requested value if value is present
     /// \param allow_write_only true to allow a writeOnly value to be read.
+    /// \param unset_value how an attribute that exists but has no value is answered
     /// \return GetVariableStatusEnum that indicates the result of the request
     GetVariableStatusEnum request_value_internal(const Component& component_id, const Variable& variable_id,
                                                  const AttributeEnum& attribute_enum, std::string& value,
-                                                 bool allow_write_only) const;
+                                                 bool allow_write_only, UnsetValue unset_value) const;
 
     /// \brief Iterates over the given \p component_criteria and converts this to the variable names
     /// (Active,Available,Enabled,Problem). If any of the variables can not be found as part of a component this
@@ -111,8 +112,8 @@ public:
     explicit DeviceModel(std::unique_ptr<DeviceModelStorageInterface> device_model_storage_interface);
 
     GetVariableStatusEnum get_variable(const Component& component_id, const Variable& variable_id,
-                                       const AttributeEnum& attribute_enum, std::string& value,
-                                       bool allow_write_only = false) const override;
+                                       const AttributeEnum& attribute_enum, std::string& value, bool allow_write_only,
+                                       UnsetValue unset_value) const override;
 
     SetVariableStatusEnum set_value(const Component& component_id, const Variable& variable_id,
                                     const AttributeEnum& attribute_enum, const std::string& value,
@@ -184,6 +185,7 @@ public:
     void set_per_slot_ocpp_version(std::int32_t slot, const std::string& version, const std::string& source) override;
     void set_security_ctrl_security_profile(std::int32_t security_profile, const std::string& source) override;
     void set_security_ctrl_identity(const std::string& identity, const std::string& source) override;
+    void set_active_message_timeout(std::int32_t message_timeout_s, const std::string& source) override;
 };
 
 } // namespace v2

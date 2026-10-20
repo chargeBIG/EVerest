@@ -4,7 +4,7 @@
 #include "Market.hpp"
 #include <algorithm>
 #include <everest/logging.hpp>
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <limits>
 
 namespace module {

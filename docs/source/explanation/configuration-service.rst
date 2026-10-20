@@ -109,11 +109,10 @@ options. There are three cases.
   configurations. The database never holds the manager ``settings:`` block, so
   the settings come from built-in defaults: installation paths (``prefix``,
   ``modules_dir``, ``interfaces_dir``, ``types_dir``, ``errors_dir``,
-  ``schemas_dir``, ``configs_dir``, ``www_dir``, ``logging_config_file``), MQTT
-  broker and prefixes (``mqtt_broker_host``, ``mqtt_broker_port``,
+  ``schemas_dir``, ``configs_dir``, ``logging_config_file``), MQTT broker and
+  prefixes (``mqtt_broker_host``, ``mqtt_broker_port``,
   ``mqtt_broker_socket_path``, ``mqtt_everest_prefix``,
-  ``mqtt_external_prefix``), ``controller_port``,
-  ``controller_rpc_timeout_ms``, ``run_as_user``, ``telemetry_enabled``,
+  ``mqtt_external_prefix``), ``run_as_user`` (deprecated), ``telemetry_enabled``,
   ``telemetry_prefix``, ``validate_schema`` and ``forward_exceptions``.
   Deployments that need any non-default setting pass ``--config`` alongside
   ``--db``.
@@ -125,19 +124,34 @@ options. There are three cases.
   user.
 
 ``--config`` **and** ``--db``
-  The database wins when it holds a valid boot slot, and the YAML is then
-  ignored. Otherwise the database is seeded from the YAML config.
+  The database wins when its boot slot holds at least one module, and the YAML
+  is then ignored. Otherwise (no boot slot yet, or a boot slot without modules)
+  the boot slot is seeded from the YAML config. If the YAML fails to load or
+  validate, the boot slot is still written, as an empty placeholder: its
+  ``config_file_path`` points at the YAML and its ``description`` records the
+  error. The manager then behaves as for a configuration without modules (exit,
+  or ``Idle`` with ``--into-idle``/``--idle-on-failure``), and the next start
+  re-seeds the slot once the YAML is fixed.
+
+In every case the boot slot exists after the bootstrap, so the slot reported as
+active by the Configuration API is always present in the database.
 
 Related options:
 
-- ``--reset-from-yaml`` (experimental) discards the existing database slot and
-  re-seeds from the YAML config file. Intended for development use, when you
+- ``--reset-from-yaml`` (experimental) replaces the contents of the boot slot
+  from the YAML config file, even if it holds modules; with an invalid YAML it
+  aborts without touching the database. Intended for development use, when you
   want to reset to a known YAML state. Requires ``--config``.
 - ``--db-init`` is deprecated and has no effect. Seeding the database from YAML
-  when it holds no valid configuration is now the default; use
+  when its boot slot holds no modules is now the default; use
   ``--reset-from-yaml`` to force re-seeding.
 - ``--conf`` is a deprecated alias for ``--config``. Passing both at once is
   rejected as ambiguous.
+
+The ``settings:`` keys ``www_dir``, ``controller_port`` and
+``controller_rpc_timeout_ms`` belonged to the removed admin panel backend. They
+are deprecated: a config that still sets them is accepted, the values are
+ignored and the manager logs a warning for each of them at startup.
 
 .. note::
 
@@ -271,7 +285,7 @@ No special tooling is required for production or development deployments:
     # YAML is authoritative; in-memory database, re-seeded on every start
     ./manager --config my_config.yaml
 
-    # Database-backed: used once it holds a valid configuration,
+    # Database-backed: used once its boot slot holds modules,
     # seeded from YAML otherwise
     ./manager --config my_config.yaml --db everest.db
 
@@ -319,11 +333,12 @@ Two independent mechanisms gate every write:
   for that caller ``ReadOnly`` parameters are treated as writable, so the write
   is accepted and persisted, but it typically only takes effect after a reboot.
 
-Values are validated against the parameter's **datatype** before anything is
-persisted, so a value that would fail to parse on the next boot is rejected up
-front. This is a datatype check only — no range (min/max) validation happens at
-this layer, so a badly chosen but well-typed value is accepted here and can
-still be refused by the module.
+Values are validated before anything is persisted, first against the
+parameter's **datatype** and then against its entry in the module **manifest**
+(``enum``, ``minimum``, ``maximum`` and the other schema keywords), the same
+check a configuration file gets. A value that fails either check is rejected
+with the reason, so a slot never stores a value it could not boot with. A value
+that passes can still be refused by the module at runtime.
 
 By a Configuration API Client
 =============================
@@ -378,3 +393,54 @@ returned to the calling module, with an explanation carrying the reason, for
 example the module's runtime veto.
 
 .. mermaid:: images/config_service_write_module.mmd
+
+.. _exp-configuration-service-change-notifications:
+
+**************************************
+Change Notifications for Other Modules
+**************************************
+
+A module can follow the configuration of another module, for example to mirror
+some of its parameters. It registers a handler for that module with the
+framework's configuration service client:
+
+.. code-block:: cpp
+
+    get_config_service_client()->register_config_update_handler(
+        "auth", [](const Everest::config::ConfigUpdateNotification& notification) {
+            // notification.identifier, notification.value, notification.status, notification.origin
+        });
+
+The manager sends a notification for every parameter change of the active slot
+that the ConfigServiceCore accepted, whether it came from a Configuration API
+Client or from an EVerest module. ``status`` is ``Accepted`` if the target
+module applied the value at runtime, and ``RebootRequired`` if it applies on the
+next start. ``origin`` names the module that requested the change and is empty
+for changes from outside EVerest. Changes that were not persisted, and changes of
+inactive slots, are not sent.
+
+A notification reaches a module only if its access rules allow it to read the
+configuration of the changed module, through ``allow_read`` for that module or
+``allow_global_read``. The changed module itself is notified as well, so it can
+follow changes that others make to its own configuration:
+
+.. code-block:: yaml
+
+    active_modules:
+      ocpp:
+        module: OCPPmulti
+        access:
+          config:
+            modules:
+              auth:
+                allow_read: true
+
+Registering a handler for an unknown module, or for one the access rules do not
+allow reading, fails: ``register_config_update_handler`` logs a warning and
+returns ``std::nullopt`` instead of the function that unregisters the handler.
+
+The module that requested a change is not notified about it; it receives the
+result as the reply to its write request. Notifications are not retained, so a
+module reads the current values after registering its handler. The handler runs
+on the module's MQTT dispatch thread, and notifications for one module arrive in
+the order the changes were accepted.

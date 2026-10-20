@@ -27,7 +27,7 @@
 #include <boost/program_options.hpp>
 
 #include <fmt/color.h>
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <fmt/ranges.h>
 
 #include <configuration_api.hpp>
@@ -44,7 +44,6 @@
 #include <utils/status_fifo.hpp>
 
 #include "manager.hpp"
-#include "manager_admin_panel.hpp"
 #include "system_unix.hpp"
 #include <generated/version_information.hpp>
 
@@ -72,21 +71,14 @@ struct ModuleStartInfo {
         javascript,
         python
     };
-    ModuleStartInfo(const std::string& name_, const std::string& printable_name_, Language lang_, const fs::path& path_,
-                    std::vector<std::string> capabilities_) :
-        name(name_),
-        printable_name(printable_name_),
-        language(lang_),
-        path(path_),
-        capabilities(std::move(capabilities_)) {
+    ModuleStartInfo(const std::string& name_, const std::string& printable_name_, Language lang_,
+                    const fs::path& path_) :
+        name(name_), printable_name(printable_name_), language(lang_), path(path_) {
     }
     std::string name;
     std::string printable_name;
     Language language;
     fs::path path;
-
-    // required capabilities of this module
-    std::vector<std::string> capabilities;
 };
 
 namespace {
@@ -260,11 +252,9 @@ void spawn_modules(const std::vector<ModuleStartInfo>& modules, const ManagerSet
 
     for (const auto& module : modules) {
 
-        auto proc_handle = system::SubProcess::create(ms.run_as_user, module.capabilities);
+        auto proc_handle = system::SubProcess::create(ms.run_as_user);
 
         if (proc_handle.is_child()) {
-            // first, check if we need any capabilities
-
             try {
                 exec_module(rs, ms.mqtt_settings, module, proc_handle);
             } catch (const std::exception& err) {
@@ -540,9 +530,7 @@ void Manager::publish_final_status_and_disconnect(MQTTAbstraction& mqtt_abstract
     mqtt_abstraction.disconnect();
 }
 
-int Manager::transition_to_exiting_after_shutdown(RuntimeContext& ctx, ManagerAdminPanel& admin_panel, int exit_code,
-                                                  bool reset_state) {
-    admin_panel.shutdown_controller();
+int Manager::transition_to_exiting_after_shutdown(RuntimeContext& ctx, int exit_code, bool reset_state) {
     if (reset_state) {
         reset_shutdown_state();
     }
@@ -565,13 +553,9 @@ Manager::RestartOutcome Manager::handle_restart_modules_after_shutdown(RuntimeCo
     cleanup_modules_state_if_configured(ctx);
 
     // The drain is complete and the restart intent is being acted on now, so the shutdown
-    // bookkeeping has served its purpose - on BOTH outcomes. Leaving m_shutdown_cause == Restart on
-    // the failure path made advance_lifecycle_state_if_ready() re-enter this function on every
-    // main-loop iteration (its transition_to(Idle) is then a no-op self-transition that still
-    // reported TransitionApplied), starving handle_controller_ipc_poll() and handle_signal_poll():
-    // 100% CPU and SIGINT/SIGTERM ignored. handle_finish_crash_recovery() already clears it; this is
-    // that missing symmetry. Deliberately not reset: m_unexpected_module_exit_count, which must keep
-    // bounding crash recovery.
+    // bookkeeping has served its purpose - on BOTH outcomes. A stale m_shutdown_cause would make a
+    // later drain finalize as a restart. Deliberately not reset: m_unexpected_module_exit_count,
+    // which must keep bounding crash recovery.
     reset_shutdown_state();
 
     if (reload_and_update_context(ctx)) {
@@ -608,7 +592,7 @@ void Manager::settle_into_idle_after_failed_start(std::string_view reason) {
     transition_to(ManagerState::Idle);
 }
 
-std::optional<int> Manager::handle_finish_normal_shutdown(RuntimeContext& ctx, ManagerAdminPanel& admin_panel) {
+std::optional<int> Manager::handle_finish_normal_shutdown(RuntimeContext& ctx) {
     const std::string bad_modules = format_unclean_exits();
     // Cleanup module state while MQTT is still connected (must be before disconnect_mqtt() in Exiting path).
     cleanup_modules_state_if_configured(ctx);
@@ -621,7 +605,7 @@ std::optional<int> Manager::handle_finish_normal_shutdown(RuntimeContext& ctx, M
             EVLOG_warning << "Modules that did not shut down cleanly:" << bad_modules;
             print_shutdown_message(m_shutdown_start_time);
         }
-        return transition_to_exiting_after_shutdown(ctx, admin_panel, EXIT_SUCCESS, true);
+        return transition_to_exiting_after_shutdown(ctx, EXIT_SUCCESS, true);
     }
 
     // A drain that finishes without SIGINT/SIGTERM stays alive in Idle UNCONDITIONALLY -
@@ -637,7 +621,7 @@ std::optional<int> Manager::handle_finish_normal_shutdown(RuntimeContext& ctx, M
     return transition_to_idle_after_shutdown("Manager is idle after module shutdown. Send SIGINT/SIGTERM to stop.");
 }
 
-std::optional<int> Manager::handle_finish_crash_recovery(RuntimeContext& ctx, ManagerAdminPanel& admin_panel) {
+std::optional<int> Manager::handle_finish_crash_recovery(RuntimeContext& ctx) {
     const auto duration_ms = m_shutdown_start_time.has_value()
                                  ? std::chrono::duration_cast<std::chrono::milliseconds>(
                                        std::chrono::steady_clock::now() - m_shutdown_start_time.value())
@@ -668,21 +652,21 @@ std::optional<int> Manager::handle_finish_crash_recovery(RuntimeContext& ctx, Ma
     }
 
     EVLOG_critical << "Unexpected module exit; manager is exiting.";
-    return transition_to_exiting_after_shutdown(ctx, admin_panel, EXIT_FAILURE, false);
+    return transition_to_exiting_after_shutdown(ctx, EXIT_FAILURE, false);
 }
 
-std::optional<int> Manager::handle_finalize_shutdown_transition(RuntimeContext& ctx, ManagerAdminPanel& admin_panel,
-                                                                bool restart_requested, bool crash_in_progress) {
+std::optional<int> Manager::handle_finalize_shutdown_transition(RuntimeContext& ctx, bool restart_requested,
+                                                                bool crash_in_progress) {
     if (crash_in_progress) {
-        return handle_finish_crash_recovery(ctx, admin_panel);
+        return handle_finish_crash_recovery(ctx);
     }
     if (restart_requested) {
         if (handle_restart_modules_after_shutdown(ctx) == RestartOutcome::ExitFailure) {
-            return transition_to_exiting_after_shutdown(ctx, admin_panel, EXIT_FAILURE, false);
+            return transition_to_exiting_after_shutdown(ctx, EXIT_FAILURE, false);
         }
         return std::nullopt;
     }
-    return handle_finish_normal_shutdown(ctx, admin_panel);
+    return handle_finish_normal_shutdown(ctx);
 }
 
 void Manager::handle_initiate_graceful_shutdown(const std::chrono::steady_clock::time_point& module_exited_time,
@@ -966,12 +950,14 @@ int Manager::run() {
     }
     if (not ms.run_as_user.empty()) {
         EVLOG_info << "EVerest will run as system user: " << ms.run_as_user;
+        EVLOG_warning << "Setting 'run_as_user' is deprecated; start the manager as that user instead.";
     }
     if (ms.runtime_settings.forward_exceptions) {
         EVLOG_info << "Catching and forwarding command exceptions to callers";
     }
-
-    auto admin_panel = ManagerAdminPanel::create(ms);
+    for (const auto& key : ms.deprecated_settings) {
+        EVLOG_warning << "Setting '" << key << "' is deprecated and ignored; remove it from the config";
+    }
 
     EVLOG_verbose << fmt::format("EVerest prefix was set to {}", ms.runtime_settings.prefix.string());
 
@@ -1016,21 +1002,22 @@ int Manager::run() {
         return EXIT_SUCCESS;
     }
 
+    // Set when the YAML config failed to load or validate: the bootstrap then wrote an empty placeholder
+    // boot slot, and the boot decision below reports this reason instead of a bare "no modules".
+    std::optional<std::string> seed_failure;
     {
         auto bs = init_database_bootstrap(ms, reset_from_yaml);
         m_db_connection = std::move(bs.db_connection);
         if (not bs.module_configs_initialized) {
-            // No valid database entry and it is impossible to write one, so exiting is the default.
-            // --idle-on-failure / --into-idle continue into the lifecycle instead, where the
-            // Configuration API can be used to push a corrected configuration. The database is left
-            // untouched (no empty slot is seeded), so the boot arrives below with no modules.
-            if (not m_idle_on_failure and not boot_into_idle) {
-                EVLOG_critical << "Couldn't initialize the configuration database!";
-                return EXIT_FAILURE;
-            }
-            EVLOG_warning << "Couldn't initialize the configuration database; continuing without a configuration "
-                             "because --idle-on-failure or --into-idle was given. No modules will be started.";
+            // The boot slot could not be written (or --reset-from-yaml met an invalid YAML and kept the
+            // existing slot). Nothing downstream can work without a boot slot, so this aborts regardless
+            // of --idle-on-failure / --into-idle. An invalid YAML alone never ends up here: it seeds an
+            // empty placeholder slot and is handled like a configuration without modules below.
+            EVLOG_critical << "Couldn't initialize the configuration database!"
+                           << (bs.seed_failure.has_value() ? " " + *bs.seed_failure : std::string{});
+            return EXIT_FAILURE;
         }
+        seed_failure = std::move(bs.seed_failure);
     }
 
     // Without --db the database is in-memory and dies with the process; runtime configuration
@@ -1157,9 +1144,6 @@ int Manager::run() {
         case ModuleStatusAction::AtRest:
             m_config_service_core->set_modules_at_rest();
             break;
-        case ModuleStatusAction::RestartTriggered:
-            m_config_service_core->notice_module_restart_triggered();
-            break;
         }
     });
 
@@ -1267,8 +1251,8 @@ int Manager::run() {
     } api_teardown_guard{*mqtt_abstraction, *m_config_service_core};
 
     // Covers the exits from run() that are not returns. run() can also leave by throwing - a module
-    // with no loadable binary in handle_start_modules() below, a failing waitpid(), an unexpected
-    // controller exit - and main() catches that only after run()'s locals are gone, i.e. after
+    // with no loadable binary in handle_start_modules() below, a failing waitpid(), an unknown child
+    // exit - and main() catches that only after run()'s locals are gone, i.e. after
     // ~MQTTAbstractionImpl has performed a *clean* disconnect, which suppresses the last will. The
     // retained lifecycle status would then keep claiming EVerest is running until the next start.
     // Destroyed before api_teardown_guard (declared after it on purpose), so it publishes while the
@@ -1283,9 +1267,9 @@ int Manager::run() {
         }
     } final_lifecycle_status_guard{*this, *mqtt_abstraction};
 
-    // Net for the exits that skip module teardown: the privilege-drop return below, the controller-IPC
-    // exit, and every exit by exception. Shutdown and restart paths return with m_module_handles already
-    // drained or cleared, so a warning from here means an exit forgot to stop its modules.
+    // Net for the exits that skip module teardown: the privilege-drop return below and every exit by
+    // exception. Shutdown and restart paths return with m_module_handles already drained or cleared, so
+    // a warning from here means an exit forgot to stop its modules.
     // PR_SET_PDEATHSIG (see system::SubProcess::create()) SIGTERMs the modules only once this process
     // actually dies, and is cleared when a module's exec changes credentials - a backstop, not the
     // guarantee. Declared after final_lifecycle_status_guard, so it runs first and the modules are gone
@@ -1298,21 +1282,27 @@ int Manager::run() {
     } module_process_guard{*this};
 
     if (boot_into_idle) {
+        if (seed_failure.has_value()) {
+            EVLOG_warning << *seed_failure << " Entering Idle without modules.";
+        }
         EVLOG_info << "Requested by command-line-parameter -> entering Idle";
         transition_to(ManagerState::Idle);
     } else if (not runtime_ctx_has_valid_config or runtime_ctx.config->get_module_configurations().empty()) {
         // Both "nothing startable at boot" outcomes - a configuration that does not load or validate,
-        // and one without modules - share one decision: exit by default, or stay in Idle and report
-        // FailedToStart with --idle-on-failure so a corrected configuration can be pushed.
+        // and one without modules (including the empty placeholder slot seeded for an invalid YAML) -
+        // share one decision: exit by default, or stay in Idle and report FailedToStart with
+        // --idle-on-failure so a corrected configuration can be pushed.
         // The emptiness check must stay behind the short circuit: config is null when the load failed.
-        const std::string_view failure_reason =
-            runtime_ctx_has_valid_config ? "Module configuration contains no modules (empty or missing active_modules)."
-                                         : "Failed to load and validate config!";
+        const std::string failure_reason =
+            not runtime_ctx_has_valid_config ? std::string{"Failed to load and validate config!"}
+            : seed_failure.has_value()
+                ? fmt::format("Module configuration contains no modules: {}", *seed_failure)
+                : std::string{"Module configuration contains no modules (empty or missing active_modules)."};
         if (not m_idle_on_failure) {
             EVLOG_error << failure_reason;
             EVLOG_error << "Manager is exiting. Pass --idle-on-failure (or --into-idle) to keep the manager "
                            "running in Idle without modules instead.";
-            return transition_to_exiting_after_shutdown(runtime_ctx, admin_panel, EXIT_FAILURE, false);
+            return transition_to_exiting_after_shutdown(runtime_ctx, EXIT_FAILURE, false);
         }
         settle_into_idle_after_failed_start(fmt::format(
             "{} Manager stays idle; load a startable configuration and request a restart.", failure_reason));
@@ -1320,22 +1310,24 @@ int Manager::run() {
         handle_start_modules(runtime_ctx);
     }
 
-    if (const auto err_set_user = ManagerAdminPanel::switch_manager_user_if_needed(runtime_ctx.ms)) {
-        EVLOG_error << "Error switching manager to user " << runtime_ctx.ms.run_as_user << ": " << *err_set_user;
-        // Same exit sequence as every other exiting path, so the retained lifecycle status is published
-        // explicitly here instead of being left to the LWT fallback.
-        return transition_to_exiting_after_shutdown(runtime_ctx, admin_panel, EXIT_FAILURE, false);
+    if (not runtime_ctx.ms.run_as_user.empty()) {
+        if (const auto err_set_user = system::set_real_user(runtime_ctx.ms.run_as_user); not err_set_user.empty()) {
+            EVLOG_error << "Error switching manager to user " << runtime_ctx.ms.run_as_user << ": " << err_set_user;
+            // Same exit sequence as every other exiting path, so the retained lifecycle status is published
+            // explicitly here instead of being left to the LWT fallback.
+            return transition_to_exiting_after_shutdown(runtime_ctx, EXIT_FAILURE, false);
+        }
     }
 
     int wstatus; // NOLINT(cppcoreguidelines-init-variables): this is always initialized in the following waitpid call
     m_shutdown_info.clear();
 
     while (true) {
-        if (handle_waitpid_event(wstatus, runtime_ctx, admin_panel)) {
+        if (handle_waitpid_event(wstatus, runtime_ctx)) {
             continue;
         }
 
-        const auto lifecycle_advance = advance_lifecycle_state_if_ready(runtime_ctx, admin_panel);
+        const auto lifecycle_advance = advance_lifecycle_state_if_ready(runtime_ctx);
         if (lifecycle_advance.status == LifecycleAdvanceResult::Status::ExitRequested) {
             return *lifecycle_advance.exit_code;
         }
@@ -1343,14 +1335,10 @@ int Manager::run() {
             continue;
         }
 
-        if (const auto exit_from_panel = handle_controller_ipc_poll(runtime_ctx, admin_panel, prefix_opt)) {
-            return *exit_from_panel;
-        }
-
         // Consume any deferred LifecycleAPI stop/restart request
         handle_lifecycle_api_request(runtime_ctx);
 
-        if (const auto exit_from_signal = handle_signal_poll(signal_polling, runtime_ctx, admin_panel)) {
+        if (const auto exit_from_signal = handle_signal_poll(signal_polling, runtime_ctx)) {
             return *exit_from_signal;
         }
 
@@ -1370,8 +1358,6 @@ std::string_view Manager::state_to_string(ManagerState state) const {
         return "StartingModules";
     case ManagerState::Running:
         return "Running";
-    case ManagerState::RestartRequested:
-        return "RestartRequested";
     case ManagerState::CrashShutdownInProgress:
         return "CrashShutdownInProgress";
     case ManagerState::ShutdownRequested:
@@ -1489,9 +1475,6 @@ void Manager::notify_status_fifo_for_state(ManagerState state) {
     case ManagerState::Running:
         notify_status_fifo(StatusFifo::MANAGER_RUNNING);
         break;
-    case ManagerState::RestartRequested:
-        notify_status_fifo(StatusFifo::MANAGER_RESTART_REQUESTED);
-        break;
     case ManagerState::CrashShutdownInProgress:
         notify_status_fifo(StatusFifo::MANAGER_CRASH_SHUTDOWN_IN_PROGRESS);
         break;
@@ -1546,8 +1529,7 @@ ManagerState Manager::current_state_unlocked() const {
 bool Manager::is_in_shutdown_flow_state_unlocked() const {
     const auto s = current_state_unlocked();
     return (s == ManagerState::ShutdownRequested) || (s == ManagerState::CrashShutdownInProgress) ||
-           (s == ManagerState::ForceTerminating) || (s == ManagerState::RestartRequested) ||
-           (s == ManagerState::ShutdownFinalizing);
+           (s == ManagerState::ForceTerminating) || (s == ManagerState::ShutdownFinalizing);
 }
 
 void Manager::register_state_transition_handler(std::function<void(ManagerState, ManagerState)> handler) {
@@ -1566,11 +1548,6 @@ Manager::Manager(const po::variables_map& vm) :
 bool Manager::is_in_shutdown_flow_state() const {
     const std::lock_guard<std::mutex> lock(m_state_transition_mutex);
     return is_in_shutdown_flow_state_unlocked();
-}
-
-bool Manager::is_restart_requested() const {
-    const std::lock_guard<std::mutex> lock(m_state_transition_mutex);
-    return current_state_unlocked() == ManagerState::RestartRequested;
 }
 
 bool Manager::are_modules_started() const {
@@ -1670,12 +1647,12 @@ void Manager::handle_start_modules(const RuntimeContext& ctx) {
             return m_modules_ready.emplace(module_id, ModuleReadyInfo{}).first;
         }();
 
-        std::vector<std::string> capabilities =
-            module_configurations.at(module_id).capabilities.value_or(std::vector<std::string>{});
-
-        if (not capabilities.empty()) {
-            EVLOG_info << fmt::format("Module {} wants to acquire the following capabilities: {}", module_name,
-                                      fmt::join(capabilities.begin(), capabilities.end(), " "));
+        const auto& capabilities = module_configurations.at(module_id).capabilities;
+        if (capabilities.has_value() and not capabilities->empty()) {
+            EVLOG_warning << fmt::format(
+                "Module {} ({}) sets 'capabilities' in the config. This is no longer supported and ignored, declare "
+                "them in the module manifest and grant them as file capabilities on the module binary instead.",
+                module_id, module_name);
         }
 
         const Handler module_ready_handler = [this, module_id, &mqtt_abstraction, standalone_modules,
@@ -1749,16 +1726,16 @@ void Manager::handle_start_modules(const RuntimeContext& ctx) {
 
         if (fs::exists(binary_path)) {
             EVLOG_debug << fmt::format("module: {} ({}) provided as binary", module_id, module_name);
-            modules_to_spawn.emplace_back(module_id, printable_module_name, ModuleStartInfo::Language::cpp, binary_path,
-                                          capabilities);
+            modules_to_spawn.emplace_back(module_id, printable_module_name, ModuleStartInfo::Language::cpp,
+                                          binary_path);
         } else if (fs::exists(javascript_library_path)) {
             EVLOG_debug << fmt::format("module: {} ({}) provided as javascript library", module_id, module_name);
             modules_to_spawn.emplace_back(module_id, printable_module_name, ModuleStartInfo::Language::javascript,
-                                          fs::canonical(javascript_library_path), capabilities);
+                                          fs::canonical(javascript_library_path));
         } else if (fs::exists(python_module_path)) {
             EVLOG_verbose << fmt::format("module: {} ({}) provided as python module", module_id, module_name);
             modules_to_spawn.emplace_back(module_id, printable_module_name, ModuleStartInfo::Language::python,
-                                          fs::canonical(python_module_path), capabilities);
+                                          fs::canonical(python_module_path));
         } else {
             if (module_id == "probe" || module_name == "ProbeModule") {
                 EVLOG_error << "You are trying to start the probe module as binary, please check "
@@ -1779,8 +1756,7 @@ void Manager::handle_start_modules(const RuntimeContext& ctx) {
     spawn_modules(modules_to_spawn, ms, m_module_handles);
 }
 
-Manager::LifecycleAdvanceResult Manager::advance_lifecycle_state_if_ready(RuntimeContext& ctx,
-                                                                          ManagerAdminPanel& admin_panel) {
+Manager::LifecycleAdvanceResult Manager::advance_lifecycle_state_if_ready(RuntimeContext& ctx) {
     const bool in_shutdown_flow = is_in_shutdown_flow_state();
     const bool crash_in_progress = (m_shutdown_cause == ShutdownCause::Crash);
     const bool restart_requested = (m_shutdown_cause == ShutdownCause::Restart);
@@ -1807,12 +1783,14 @@ Manager::LifecycleAdvanceResult Manager::advance_lifecycle_state_if_ready(Runtim
                 return {LifecycleAdvanceResult::Status::TransitionApplied, std::nullopt};
             case RestartOutcome::ExitFailure:
                 return {LifecycleAdvanceResult::Status::ExitRequested,
-                        transition_to_exiting_after_shutdown(ctx, admin_panel, EXIT_FAILURE, false)};
+                        transition_to_exiting_after_shutdown(ctx, EXIT_FAILURE, false)};
             case RestartOutcome::StayedIdle:
                 break;
             }
-            // See the restart path below: a failed reload settles into Idle without applying a
-            // transition, so the main loop must still service controller IPC and signals.
+            // A failed reload settles into Idle without applying a transition. Report NoTransition so
+            // the main loop still services lifecycle requests and signals on this iteration: a
+            // "transition applied" that changes nothing makes run() continue past both polls, which is
+            // what would turn a failed restart into an unresponsive manager.
             return {LifecycleAdvanceResult::Status::NoTransition, std::nullopt};
         }
         if (crash_in_progress && m_unexpected_module_exit_count > MAX_UNEXPECTED_MODULE_RESTARTS) {
@@ -1821,46 +1799,17 @@ Manager::LifecycleAdvanceResult Manager::advance_lifecycle_state_if_ready(Runtim
                                        m_unexpected_module_exit_count, MAX_UNEXPECTED_MODULE_RESTARTS);
             notify_status_fifo(StatusFifo::CRASH_RECOVERY_EXHAUSTED);
         }
-        if (const auto exit_code =
-                handle_finalize_shutdown_transition(ctx, admin_panel, restart_requested, crash_in_progress)) {
+        if (const auto exit_code = handle_finalize_shutdown_transition(ctx, restart_requested, crash_in_progress)) {
             return {LifecycleAdvanceResult::Status::ExitRequested, *exit_code};
         }
         return {LifecycleAdvanceResult::Status::TransitionApplied, std::nullopt};
     }
 
-    // Admin restart can mark restart_modules while modules are still draining.
-    // If all children are gone, restart immediately with reloaded config.
-    if (restart_requested && m_module_handles.empty()) {
-        switch (handle_restart_modules_after_shutdown(ctx)) {
-        case RestartOutcome::Restarted:
-            return {LifecycleAdvanceResult::Status::TransitionApplied, std::nullopt};
-        case RestartOutcome::ExitFailure:
-            return {LifecycleAdvanceResult::Status::ExitRequested,
-                    transition_to_exiting_after_shutdown(ctx, admin_panel, EXIT_FAILURE, false)};
-        case RestartOutcome::StayedIdle:
-            break;
-        }
-        // The restart failed and the manager settled into Idle. Report NoTransition so the main loop
-        // still services controller IPC and signals on this iteration: a "transition applied" that
-        // changes nothing makes run() continue past both polls, which is what would turn a failed
-        // restart into an unresponsive manager.
-        return {LifecycleAdvanceResult::Status::NoTransition, std::nullopt};
-    }
-
     return {LifecycleAdvanceResult::Status::NoTransition, std::nullopt};
 }
 
-bool Manager::handle_child_exit(pid_t pid, int wstatus, RuntimeContext& ctx, ManagerAdminPanel& admin_panel) {
+bool Manager::handle_child_exit(pid_t pid, int wstatus, RuntimeContext& ctx) {
     auto module_exited_time = std::chrono::steady_clock::now();
-    if (admin_panel.is_controller_process(pid)) {
-        // During intentional manager shutdown/restart, controller exit is expected.
-        if (is_in_shutdown_flow_state() || m_state == ManagerState::Exiting || m_sigint_received ||
-            is_restart_requested()) {
-            EVLOG_info << "Controller process exited during manager shutdown/restart.";
-            return true;
-        }
-        admin_panel.throw_if_controller_exited(pid);
-    }
     const std::string wait_status = format_wait_status(wstatus);
 
     const auto module_iter = m_module_handles.find(pid);
@@ -1907,7 +1856,7 @@ bool Manager::handle_child_exit(pid_t pid, int wstatus, RuntimeContext& ctx, Man
     return false;
 }
 
-std::optional<int> Manager::handle_signal(int signo, RuntimeContext& ctx, ManagerAdminPanel& admin_panel) {
+std::optional<int> Manager::handle_signal(int signo, RuntimeContext& ctx) {
     if (signo != SIGINT && signo != SIGTERM) {
         return std::nullopt;
     }
@@ -1926,7 +1875,7 @@ std::optional<int> Manager::handle_signal(int signo, RuntimeContext& ctx, Manage
         if (m_module_handles.empty()) {
             // Nothing to drain: exit through the common sequence instead of repeating it inline.
             print_shutdown_message(m_shutdown_start_time);
-            return transition_to_exiting_after_shutdown(ctx, admin_panel, EXIT_SUCCESS, false);
+            return transition_to_exiting_after_shutdown(ctx, EXIT_SUCCESS, false);
         }
         transition_to(ManagerState::ShutdownRequested);
         EVLOG_info << "Shutting down modules...";
@@ -1950,9 +1899,9 @@ std::optional<int> Manager::handle_signal(int signo, RuntimeContext& ctx, Manage
         m_module_handles.clear();
     }
     // Same exit sequence as every other exiting path: closing message first (while the shutdown
-    // start time is still around), then controller shutdown, the transition and the MQTT disconnect.
+    // start time is still around), then the transition and the MQTT disconnect.
     print_shutdown_message(m_shutdown_start_time);
-    return transition_to_exiting_after_shutdown(ctx, admin_panel, EXIT_FAILURE, false);
+    return transition_to_exiting_after_shutdown(ctx, EXIT_FAILURE, false);
 }
 
 void Manager::handle_shutdown_timeout(RuntimeContext& ctx) {
@@ -1962,8 +1911,7 @@ void Manager::handle_shutdown_timeout(RuntimeContext& ctx) {
 
     const auto now = std::chrono::steady_clock::now();
     const bool should_check_shutdown_timeout =
-        (m_state == ManagerState::ShutdownRequested || m_state == ManagerState::CrashShutdownInProgress ||
-         m_state == ManagerState::RestartRequested) &&
+        (m_state == ManagerState::ShutdownRequested || m_state == ManagerState::CrashShutdownInProgress) &&
         m_shutdown_start_time.has_value();
 
     // Without --graceful-shutdown there is no drain phase: force-terminate as soon as the
@@ -2000,8 +1948,8 @@ void Manager::handle_shutdown_timeout(RuntimeContext& ctx) {
     m_force_kill_sent = true;
 }
 
-bool Manager::handle_waitpid_event(int& wstatus, RuntimeContext& ctx, ManagerAdminPanel& admin_panel) {
-    // non-blocking as this main loop also processes controller RPC and the signal fd
+bool Manager::handle_waitpid_event(int& wstatus, RuntimeContext& ctx) {
+    // non-blocking as this main loop also processes the signal fd
     const auto pid = waitpid(-1, &wstatus, WNOHANG);
     if (pid == 0) {
         return false;
@@ -2021,39 +1969,7 @@ bool Manager::handle_waitpid_event(int& wstatus, RuntimeContext& ctx, ManagerAdm
         }
         return false;
     }
-    return handle_child_exit(pid, wstatus, ctx, admin_panel);
-}
-
-std::optional<int> Manager::handle_controller_ipc_poll(RuntimeContext& ctx, ManagerAdminPanel& admin_panel,
-                                                       const std::string& prefix_opt) {
-    bool modules_started = are_modules_started();
-    const bool restart_already_requested = is_restart_requested();
-    bool restart_requested = restart_already_requested;
-    if (const auto exit_from_panel = admin_panel.poll_controller_ipc(restart_requested, modules_started, prefix_opt)) {
-        // Controller IPC is gone: exit through the common sequence so the retained lifecycle status is
-        // published before the disconnect, like every other exiting path. SIGTERMing a controller that
-        // just failed its IPC is tolerated (see ManagerAdminPanel::shutdown_controller()).
-        return transition_to_exiting_after_shutdown(ctx, admin_panel, *exit_from_panel, false);
-    }
-
-    // Only act on the transition into RestartRequested; the state itself preserves the restart
-    // intent for advance_lifecycle_state_if_ready() once all children have exited.
-    if (restart_requested && !restart_already_requested) {
-        m_shutdown_cause = ShutdownCause::Restart;
-        transition_to(ManagerState::RestartRequested);
-        if (m_graceful_shutdown_enabled) {
-            ctx.mqtt_abstraction.publish(fmt::format("{}shutdown", ctx.ms.mqtt_settings.everest_prefix),
-                                         std::string("true"), QOS::QOS2, false);
-        }
-        // Arm the graceful-shutdown deadline once so timeout/fallback handling covers modules
-        // that do not exit after the MQTT shutdown publish. Re-arming on subsequent loop
-        // iterations would push the force-terminate deadline back forever.
-        if (!m_module_handles.empty()) {
-            m_shutdown_start_time = std::chrono::steady_clock::now();
-        }
-    }
-
-    return std::nullopt;
+    return handle_child_exit(pid, wstatus, ctx);
 }
 
 int Manager::signal_poll_timeout_ms() const {
@@ -2068,14 +1984,11 @@ bool Manager::lifecycle_api_active() const {
     return m_vm.count("lifecycle-api") != 0;
 }
 
-std::optional<int> Manager::handle_signal_poll(system::SignalPolling& signal_polling, RuntimeContext& ctx,
-                                               ManagerAdminPanel& admin_panel) {
-    // A readable controller IPC socket or lifecycle wakeup eventfd also ends the poll, so controller
-    // requests and LifecycleAPI stop/restart requests are serviced promptly on the next loop
-    // iteration even during a long idle poll.
+std::optional<int> Manager::handle_signal_poll(system::SignalPolling& signal_polling, RuntimeContext& ctx) {
+    // A readable lifecycle wakeup eventfd also ends the poll, so LifecycleAPI stop/restart requests
+    // are serviced promptly on the next loop iteration even during a long idle poll.
     const int lifecycle_wakeup_fd = m_lifecycle_wakeup_fd.load();
-    const auto signal_received = signal_polling.poll_signal(
-        signal_poll_timeout_ms(), admin_panel.controller_ipc_fd().value_or(-1), lifecycle_wakeup_fd);
+    const auto signal_received = signal_polling.poll_signal(signal_poll_timeout_ms(), lifecycle_wakeup_fd);
 
     // Drain the lifecycle wakeup eventfd (non-blocking): one read returns and zeroes the whole
     // accumulated counter. The read() is a full barrier so the subsequent exchange in
@@ -2090,7 +2003,7 @@ std::optional<int> Manager::handle_signal_poll(system::SignalPolling& signal_pol
     if (!signal_received.has_value()) {
         return std::nullopt;
     }
-    return handle_signal(signal_received.value(), ctx, admin_panel);
+    return handle_signal(signal_received.value(), ctx);
 }
 
 int main(int argc, char* argv[]) {
@@ -2127,16 +2040,17 @@ int main(int argc, char* argv[]) {
     desc.add_options()("db", po::value<std::string>(),
                        "Full path to the configuration database file. Optional: without --db an in-memory database "
                        "is used and the YAML config is authoritative on every start. With --db and --config, the "
-                       "database wins when it holds a valid configuration; otherwise it is seeded from the YAML "
-                       "config.");
+                       "database wins when its boot slot holds at least one module; a missing or module-less boot "
+                       "slot is seeded from the YAML config. An invalid YAML seeds an empty placeholder slot whose "
+                       "description records the error.");
     desc.add_options()("db-init",
-                       "Deprecated, no effect: seeding the database from YAML when it holds no valid configuration "
+                       "Deprecated, no effect: seeding the database from YAML when its boot slot holds no modules "
                        "is now the default. Ignored unless both --config and --db are given. Use --reset-from-yaml "
                        "to force re-seeding.");
     desc.add_options()("reset-from-yaml",
-                       "Experimental: Discard the existing database slot and re-seed from the YAML config file. "
-                       "Intended for development use when you want to reset to a known YAML state. "
-                       "Requires --config.");
+                       "Experimental: Replace the contents of the boot slot with the YAML config file, even if it "
+                       "holds modules; aborts without touching the database if the YAML is invalid. Intended for "
+                       "development use when you want to reset to a known YAML state. Requires --config.");
     desc.add_options()("into-idle",
                        "Experimental: Boot into idle state (no modules are started). Also enters Idle instead of "
                        "exiting when the configuration is invalid, missing or contains no modules.");

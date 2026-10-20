@@ -1,9 +1,10 @@
 active_modules:
   iso15118_charger:
-    module: EvseV2G
+    module: Evse15118D20
     config_module:
       device: auto
-      tls_security: allow
+      supported_ISO15118_2: true
+      supported_DIN70121: true
     connections:
       security:
         - module_id: evse_security
@@ -315,5 +316,9 @@ active_modules:
         database_path: /tmp/error_history.db
   system:
     module: System
+    connections:
+      store:
+        - module_id: persistent_store
+          implementation_id: main
 
 x-module-layout: {}

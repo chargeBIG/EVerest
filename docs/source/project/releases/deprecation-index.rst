@@ -90,3 +90,52 @@ to the corresponding migration guide.
        Both options violate IEC 61851-1:2019 D.6.5 Table D.9 line 4 and must
        not be used in public environments; the module logs a warning at
        startup for either.
+   * - :ref:`API module <everest_modules_API>` (``everest_api/<connector>/cmd/*`` and
+       ``everest_api/<connector>/var/*`` topics), superseded by the
+       :ref:`EVerest API modules <everest_apis>`
+     - 2026.10.0
+     - 2027.04.0
+     - Replace the module with the EVerest API modules covering the topics in use:
+       ``evse_manager_consumer_API`` for charging control (``enable_disable``,
+       ``pause_charging``, ``resume_charging``, ``stop_charging``,
+       ``force_unlock``, ``uk_random_delay``) and EVSE state (``session_info``,
+       ``ev_info``, ``hardware_capabilities``, ``powermeter``, ``limits``,
+       ``selected_protocol``), ``external_energy_limits_consumer_API`` for
+       ``set_limit_amps``, ``set_limit_amps_phases`` and ``set_limit_watts``,
+       ``ocpp_consumer_API`` for ``ocpp/var/connection_status`` and
+       ``ocpp/var/charging_schedules``, and ``error_history_consumer_API`` for
+       ``errors/var/active_errors``. ``info/var/info`` (charger information) has
+       no replacement. The module logs a deprecation warning at startup.
+   * - :ref:`EvAPI module <everest_modules_EvAPI>` (``everest_api/ev_connectors``
+       and ``everest_api/<connector>/var/*`` topics)
+     - 2026.10.0
+     - 2027.04.0
+     - No replacement. The module logs a deprecation warning at startup.
+   * - ``error_history_consumer_API``: ``severity`` property of ``ErrorObject``
+       (all messages carrying errors: ``get_errors``, ``active_errors``,
+       ``error_raised``, ``error_cleared``), the ``severity_filter`` argument of
+       ``get_errors``, and the ``Severity`` and ``SeverityFilter`` schemas
+     - 2026.10.0
+     - 2027.04.0
+     - No replacement: EVerest defines no clear semantics for error severity.
+       Stop reading ``severity`` from error objects and do not treat it as
+       required; drop ``severity_filter`` from ``get_errors`` requests and
+       filter by ``type_filter``, ``origin_filter`` or ``state_filter`` instead.
+   * - ``settings.run_as_user`` in the EVerest config file
+     - 2026.10.0
+     - 2027.04.0
+     - Start the manager as the unprivileged user from the service manager
+       instead, e.g. ``User=everest`` in the systemd unit, and grant
+       privileged modules file capabilities (see
+       :doc:`/how-to-guides/security-best-practices`). The manager logs a
+       warning at startup when the setting is used.
+   * - ``capabilities`` key of a module entry in the EVerest config file
+       (``active_modules.<id>.capabilities``)
+     - 2026.10.0
+     - 2027.04.0
+     - Remove the key. Modules declare their capabilities in their
+       ``manifest.yaml``, and the deployment grants them as file capabilities:
+       the ``everest_file_capabilities`` class in meta-everest, or
+       ``applications/utils/scripts/set_module_capabilities.py`` elsewhere (see
+       :doc:`/how-to-guides/security-best-practices`). The key is already
+       ignored, and the manager logs a warning at startup.
