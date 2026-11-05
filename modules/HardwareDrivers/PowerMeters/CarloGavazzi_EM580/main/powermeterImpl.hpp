@@ -14,8 +14,10 @@
 
 // ev@75ac1216-19eb-4182-a85c-820f1fc2c091:v1
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include "transport.hpp"
@@ -36,6 +38,8 @@ struct Conf {
     int device_state_read_interval_ms;
     std::string public_key_format;
     bool monitor_transaction_state;
+    bool use_system_timezone;
+    int startup_transaction_state_timeout_s;
 };
 
 class powermeterImpl : public powermeterImplBase {
@@ -96,6 +100,34 @@ public:
                                                                            std::string& transaction_id) {
             return self.handle_stop_transaction(transaction_id);
         }
+
+        static void update_timezone_if_changed(powermeterImpl& self) {
+            self.write_timezone(true);
+        }
+
+        static void write_timezone_on_configure(powermeterImpl& self) {
+            self.write_timezone(false);
+        }
+
+        static void end_startup_wait(powermeterImpl& self) {
+            self.end_startup_wait();
+        }
+
+        static void set_startup_wait_timeout(powermeterImpl& self, std::chrono::milliseconds timeout) {
+            self.m_startup_wait_timeout = timeout;
+        }
+
+        static void read_transaction_state_and_id(powermeterImpl& self) {
+            self.read_transaction_state_and_id();
+        }
+
+        static void shutdown(powermeterImpl& self) {
+            self.shutdown();
+        }
+
+        static bool transaction_active(const powermeterImpl& self) {
+            return self.m_transaction_active.load();
+        }
     };
     // ev@8ea32d28-373f-4c90-ae5e-b4fcc74e2a61:v1
 
@@ -134,6 +166,14 @@ private:
     std::atomic_bool m_transaction_active{false};
     std::atomic_bool m_pending_time_sync{false};
     std::atomic_bool m_pending_closed_transaction{false};
+    std::optional<int> m_timezone_offset_minutes;
+    std::string m_system_time_zone_name;
+    bool m_startup_wait_over{false};
+    std::mutex m_startup_wait_mutex;
+    std::condition_variable m_startup_wait_cv;
+    std::optional<std::chrono::milliseconds> m_startup_wait_timeout;
+    // Serializes the operations on the transaction state of the device (start, stop, recovery on configuration,
+    // monitoring), each a sequence of Modbus requests that must not interleave. Guards m_transaction_id.
     std::mutex m_transaction_mutex;
 
     // Background threads (started in ready(), joined on destruction)
@@ -144,9 +184,11 @@ private:
     std::thread time_sync_thread_;
 
     // flag whether transactions are supported
-    bool m_transaction_support{true};
+    std::atomic_bool m_transaction_support{true};
 
     void configure_device();
+    void end_startup_wait();
+    void wait_for_startup_transaction_state();
     void read_signature_config();
     types::units_signed::SignedMeterValue read_signed_meter_value();
     void read_powermeter_values();
@@ -162,6 +204,9 @@ private:
     std::string read_ocmf_file();
     void synchronize_time();
     void set_timezone(int offset_minutes);
+    [[nodiscard]] std::optional<int> system_timezone_offset_minutes();
+    // Writes the timezone offset to the device; only_if_changed skips it when the device already has it.
+    void write_timezone(bool only_if_changed);
     void time_sync_thread();
     [[nodiscard]] bool is_transaction_active() const;
     void clear_transaction_states();
