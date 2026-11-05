@@ -22,6 +22,7 @@ target_sources(ocpp
         ocpp/common/call_types.cpp
         ocpp/common/charging_station_base.cpp
         ocpp/common/connectivity_manager.cpp
+        ocpp/common/json_number.cpp
         ocpp/common/ocpp_logging.cpp
         ocpp/common/schemas.cpp
         ocpp/common/types.cpp
@@ -40,6 +41,7 @@ if(LIBOCPP_ENABLE_V16)
             ocpp/v16/message_dispatcher.cpp
             ocpp/v16/smart_charging.cpp
             ocpp/v16/known_keys.cpp
+            ocpp/v16/known_keys_yaml.cpp
             ocpp/v16/variable_resolver.cpp
             ocpp/v16/charge_point_configuration_base.cpp
             ocpp/v16/charge_point_configuration_connectivity.cpp
@@ -85,7 +87,7 @@ if(LIBOCPP_ENABLE_V2)
             ocpp/v2/evse_manager.cpp
             ocpp/v2/init_device_model_db.cpp
             ocpp/v2/ocpp16_component_config_patcher.cpp
-            ocpp/v2/ocpp16_custom_config_mappings.cpp
+            ocpp/v2/ocpp16_key_mappings.cpp
             ocpp/v2/notify_report_requests_splitter.cpp
             ocpp/v2/message_queue.cpp
             ocpp/v2/ocpp_enums.cpp

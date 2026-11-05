@@ -38,6 +38,7 @@ cc_library(
     deps = [
         "//interfaces:interfaces_lib",
         "//lib/everest/conversions/ocpp:ocpp_conversions",
+        "//lib/everest/external_energy_limits:external_energy_limits",
         "//lib/everest/framework:framework",
         "//lib/everest/ocpp:libocpp",
         "//types:types_lib",
@@ -53,6 +54,7 @@ cc_test(
         "tests/custom_file_error_mapping_tests.cpp",
         "tests/error_handling_tests.cpp",
         "tests/error_placeholders_tests.cpp",
+        "tests/external_limits_tests.cpp",
         "tests/transaction_handler_tests.cpp",
     ],
     data = glob(["tests/data/*.json"]) + ["schemas/custom_error_mapping.example.json"] + ["//errors"],

@@ -3,7 +3,7 @@ asyncapi: 3.0.0
 id: 'pionix:de:everest:external_energy_limits_consumer_API'
 info:
   title: 'EVerest API definition for external energy limits'
-  version: 1.0.0
+  version: 1.1.0
   description: >-
     API to allow EVerest API clients to set energy limits.
 
@@ -683,7 +683,10 @@ components:
 
     CommunicationCheck:
       type: boolean
-      description: "Send 'true' at least every 'cfg_communication_check_to_s' seconds to signal module is alive. Send 'false' to stop communication check'"
+      description: >-
+        Send true at least every cfg_communication_check_to_s seconds to signal that the client is alive, otherwise
+        EVerest raises a CommunicationFault, which the next message clears. Send false to stop the check until the
+        module restarts.
     HeartBeatId:
       type: integer
       description: "64bit unsigned integer. The id of every heartbeat increases by 1 and overflows when the maximum representable value is reached"
