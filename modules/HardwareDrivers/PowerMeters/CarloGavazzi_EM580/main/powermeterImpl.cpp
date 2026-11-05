@@ -552,14 +552,15 @@ void powermeterImpl::ready() {
         const auto measurement_interval = std::chrono::milliseconds{config.live_measurement_interval_ms};
         const auto state_read_interval = std::chrono::milliseconds{config.device_state_read_interval_ms};
         auto last_interval_overrun_warning = std::chrono::steady_clock::time_point{};
+        auto measurement_start = std::chrono::steady_clock::time_point{};
         while (!stop_requested_.load()) {
-            const auto measurement_start = std::chrono::steady_clock::now();
             try {
                 if (device_not_configured.load()) {
                     configure_device();
                     device_not_configured = false;
                     last_state_read = std::chrono::steady_clock::time_point{}; // force state read
                 }
+                measurement_start = std::chrono::steady_clock::now();
                 read_powermeter_values();
                 if (m_transaction_support) {
                     const auto now = std::chrono::steady_clock::now();

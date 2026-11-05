@@ -47,7 +47,7 @@ Module configuration
 
 All configuration parameters of this module, including their defaults and descriptions, are listed in the generated
 reference section of this page (taken from the module's ``manifest.yaml``). The OCPP 1.6-only parameters
-(``ChargePointConfigPath``, ``UserConfigPath``, ``EnableLegacyConfigMigration``, ``DeviceModelConfigMappings``,
+(``ChargePointConfigPath``, ``UserConfigPath``, ``EnableLegacyConfigMigration``, ``Ocpp16KeyMappingsPath``,
 ``Ocpp16NetworkConfigSlot``) are described in context in the OCPP 1.6 configuration section below.
 
 Renamed configuration keys
@@ -148,7 +148,7 @@ served from the device model at runtime.
 In both paths, the built-in mappings from OCPP 1.6 configuration keys to device model component/variable
 combinations are documented in
 `lib/everest/ocpp/config/v16_to_v2_mapping.md <https://github.com/EVerest/everest-core/blob/main/lib/everest/ocpp/config/v16_to_v2_mapping.md>`_.
-``DeviceModelConfigMappings`` can point to a YAML file with custom mappings on top; it is applied both when migrating
+``Ocpp16KeyMappingsPath`` can point to a YAML file with custom mappings on top; it is applied both when migrating
 the legacy JSON into the device model and when serving the device-model-backed configuration at runtime. Custom
 mappings must not target the connection configuration (the ``NetworkConfiguration`` slots, the ``OCPPCommCtrlr``
 network profile selectors, or the ``SecurityCtrlr`` connection fallbacks ``Identity`` and ``BasicAuthPassword``):
@@ -232,7 +232,7 @@ sources are therefore visible and settable through the EVerest ``ocpp`` interfac
 ``set_variables``, e.g. via the ``ocpp_consumer_API`` module) regardless of the active protocol version. Note that
 an OCPP 1.6 **CSMS** still cannot address EVerest device model variables directly: ``GetConfiguration`` /
 ``ChangeConfiguration`` are key-based, and only keys with a device model mapping (built-in or via
-``DeviceModelConfigMappings``) reach the device model. Also note that variables of source ``EVEREST`` are updated
+``Ocpp16KeyMappingsPath``) reach the device model. Also note that variables of source ``EVEREST`` are updated
 by the module at runtime directly in the ``EverestDeviceModelStorage``; such updates do not trigger
 ``monitor_variables`` events on the ``ocpp`` interface (in either protocol version) — only writes performed through
 the OCPP stack or the ``ocpp`` interface do. If a component/variable is defined in both storages, the EVerest
@@ -399,7 +399,10 @@ Requires: evse_energy_sink (0-129)
 
 Typically fulfilled by :ref:`EnergyNode <everest_modules_EnergyNode>` modules. Used to apply power or ampere limits
 received from the CSMS via the SmartCharging feature (**set_external_limits**), one sink per EVSE plus one for EVSE
-id 0 (the whole charging station). See the energy management section below.
+id 0 (the whole charging station). Limits become import limits, OCPP 2.1 discharge limits export limits and setpoints
+are forwarded as setpoints. Per-phase limits of an OCPP 2.1 period are passed on as ``ac_max_current_per_phase_A`` or
+``ac_max_power_per_phase_W``, the same way as described for the OCPP201 module. Per-phase discharge limits and setpoints
+are summed up for W and collapse to the most restrictive phase for A. See the energy management section below.
 
 Requires: evse_manager (1-128)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
