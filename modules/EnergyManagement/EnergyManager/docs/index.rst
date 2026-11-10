@@ -403,3 +403,32 @@ not report takes part in no budget.
      - Seconds a changed limit is not raised again, so the next raise is based on a
        measurement that reflects the change. Above the update interval of the slowest meter
        on the site.
+
+Reporting the phase imbalance
+-----------------------------
+
+After every optimizer run the module publishes the var ``phase_imbalance`` of its
+``energy_manager`` interface (type ``PhaseImbalance`` in ``types/energy_manager.yaml``), with
+every broker strategy:
+
+* ``enabled``: whether the limiting runs, that is ``phase_symmetry_enabled`` with
+  ``PowerRedistribution``.
+* ``reference_phase`` and per phase ``L1`` to ``L3``: the site current, the imbalance above
+  the least loaded phase and the overshoot above ``max_phase_imbalance_A``. While the
+  limiting runs, also the current this run's correction takes away from what the connectors
+  draw (``corrected_A``, 0 while the limits in force already keep the phase within the
+  limit) and the ``residual_A`` that limiting cannot correct. Absent when fewer than two
+  phases of the site are measured, or when the site is the sum of the EVSE meters and one of
+  them is stale.
+* ``limiting`` and ``connectors``: the limits in force, each with the connector's energy tree
+  uuid, the limit (0 while paused), since when the connector has been capped or paused, and
+  the phases it was last seen drawing on (none before it has drawn current, while its limit
+  covers every phase it might draw on). A limit at or above the connector's own maximum
+  current limits nothing and is left out.
+* ``suspended`` and ``suspension_reason`` (``EvseMetersStale``, ``InsufficientPhases``) while
+  the limiting decides nothing during a session.
+* ``support_settled``: false in a run whose limits counted on no support from the connectors
+  on the other phases.
+
+The var is published every ``update_interval``, so a consumer that only needs changes or a
+lower rate filters on its side.

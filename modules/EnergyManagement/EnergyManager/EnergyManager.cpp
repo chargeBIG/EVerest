@@ -55,7 +55,12 @@ void EnergyManager::init() {
         }
     };
 
-    this->impl = std::make_unique<EnergyManagerImpl>(energy_manager_config, enforce_limits_callback);
+    const auto phase_imbalance_callback = [this](const types::energy_manager::PhaseImbalance& state) {
+        p_main->publish_phase_imbalance(state);
+    };
+
+    this->impl =
+        std::make_unique<EnergyManagerImpl>(energy_manager_config, enforce_limits_callback, phase_imbalance_callback);
 
     r_energy_trunk->subscribe_energy_flow_request(
         [this](types::energy::EnergyFlowRequest const& e) { this->impl->on_energy_flow_request(e); });

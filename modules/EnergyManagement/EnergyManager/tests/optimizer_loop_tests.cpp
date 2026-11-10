@@ -32,11 +32,11 @@ EnergyManagerConfig make_loop_config() {
 class RunCounter {
 public:
     void operator()(const std::vector<types::energy::EnforcedLimits>&) {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            runs++;
-        }
-        changed.notify_all();
+        count_run();
+    }
+
+    void operator()(const types::energy_manager::PhaseImbalance&) {
+        count_run();
     }
 
     /// \returns true if the count reached \p expected within \p budget
@@ -51,6 +51,14 @@ public:
     }
 
 private:
+    void count_run() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            runs++;
+        }
+        changed.notify_all();
+    }
+
     std::mutex mutex;
     std::condition_variable changed;
     int runs{0};
@@ -185,6 +193,38 @@ TEST(OptimizerLoop, FailingEnforceLimitsKeepsTheLoopRunning) {
     };
 
     EnergyManagerImpl impl(make_loop_config(), throwing_callback);
+    impl.on_energy_flow_request(make_tree(false));
+    impl.start();
+    ASSERT_TRUE(counter.wait_for_runs(1, REACTION_BUDGET));
+
+    impl.on_energy_flow_request(make_tree(true));
+
+    EXPECT_TRUE(counter.wait_for_runs(2, REACTION_BUDGET));
+    impl.stop();
+}
+
+TEST(OptimizerLoop, PublishesThePhaseImbalanceAfterEveryRun) {
+    RunCounter published;
+    EnergyManagerImpl impl(
+        make_loop_config(), [](const auto&) {}, std::ref(published));
+
+    impl.on_energy_flow_request(make_tree(false));
+    impl.start();
+    ASSERT_TRUE(published.wait_for_runs(1, REACTION_BUDGET));
+
+    impl.on_energy_flow_request(make_tree(true));
+
+    EXPECT_TRUE(published.wait_for_runs(2, REACTION_BUDGET));
+    impl.stop();
+}
+
+TEST(OptimizerLoop, FailingPhaseImbalancePublishKeepsTheLoopRunning) {
+    RunCounter counter;
+    auto throwing_callback = [](const types::energy_manager::PhaseImbalance&) {
+        throw std::runtime_error("schema validation failed");
+    };
+
+    EnergyManagerImpl impl(make_loop_config(), std::ref(counter), throwing_callback);
     impl.on_energy_flow_request(make_tree(false));
     impl.start();
     ASSERT_TRUE(counter.wait_for_runs(1, REACTION_BUDGET));

@@ -94,6 +94,12 @@ private:
     bool m_condition_held{false};
 };
 
+enum class ImbalanceLimitKind {
+    None,   ///< no cap, or one at or above the connector's own maximum
+    Capped, ///< a cap below the connector's own maximum
+    Paused, ///< a cap of 0
+};
+
 // All context data that is stored in between optimization runs
 struct BrokerContext {
     BrokerContext() {
@@ -115,6 +121,9 @@ struct BrokerContext {
         phase_imbalance_cap_A = std::nullopt;
         phase_imbalance_cap_since = std::nullopt;
         phase_imbalance_arrived_at = std::nullopt;
+        phase_imbalance_limit_kind = ImbalanceLimitKind::None;
+        phase_imbalance_limited_since = std::nullopt;
+        phase_imbalance_draws_on.clear();
         phases_in_use = ALL_GRID_PHASES;
         phases_narrower_since = std::nullopt;
     };
@@ -158,6 +167,12 @@ struct BrokerContext {
     std::optional<float> phase_imbalance_cap_A;
     std::optional<date::utc_clock::time_point> phase_imbalance_cap_since;
     std::optional<date::utc_clock::time_point> phase_imbalance_arrived_at;
+    // How phase_imbalance_cap_A holds the connector back, and the run since which it has: a
+    // new cap value keeps it, a change of kind restarts it. Reported, not used for limiting.
+    ImbalanceLimitKind phase_imbalance_limit_kind{ImbalanceLimitKind::None};
+    std::optional<date::utc_clock::time_point> phase_imbalance_limited_since;
+    // Grid phases the connector was last seen drawing on, kept while it draws nothing.
+    PhaseSet phase_imbalance_draws_on;
 
     // Grid phases the connector's trades count on, from its own per phase measurement.
     // All three while it draws nothing or has no usable reading, since it may then start on

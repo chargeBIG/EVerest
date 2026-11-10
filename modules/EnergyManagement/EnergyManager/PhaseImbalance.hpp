@@ -105,6 +105,10 @@ std::set<Phase> phases_drawn_on(const ObservedMeasurement& measurement, float no
 float measured_current_on(const ObservedMeasurement& measurement, const std::set<Phase>& phases,
                           float nominal_ac_voltage);
 
+/// \brief The reference phase and each known phase's imbalance and overshoot, without caps.
+/// Fewer than two known phases leave the reference nullopt and every report zero.
+ImbalanceResult measure_phase_imbalance(const PhaseCurrents& site_A, float max_phase_imbalance_A);
+
 /// \brief Caps that keep every pair of phases within \p max_phase_imbalance_A even when every
 /// connector draws its full cap; the module docs give the rules. Per ordered pair (p, q) the
 /// connectors loading p but not q share max - hysteresis - (U_p - U_q) - \p unmeasured_A plus

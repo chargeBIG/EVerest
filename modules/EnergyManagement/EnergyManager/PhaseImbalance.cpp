@@ -213,8 +213,7 @@ float measured_current_on(const ObservedMeasurement& measurement, const std::set
     return highest;
 }
 
-ImbalanceResult correct_phase_imbalance(const PhaseCurrents& site_A, const std::vector<ImbalanceConnector>& connectors,
-                                        float max_phase_imbalance_A, float unmeasured_A) {
+ImbalanceResult measure_phase_imbalance(const PhaseCurrents& site_A, float max_phase_imbalance_A) {
     ImbalanceResult result;
 
     std::optional<float> reference_A;
@@ -233,6 +232,27 @@ ImbalanceResult correct_phase_imbalance(const PhaseCurrents& site_A, const std::
     if (known.size() < 2) {
         result.reference.reset();
         return result;
+    }
+
+    for (const auto phase : known) {
+        auto& report = report_of(result, phase);
+        report.imbalance_A = phase_value(site_A, phase).value() - reference_A.value();
+        report.overshoot_A = std::max(0.f, report.imbalance_A - max_phase_imbalance_A);
+    }
+    return result;
+}
+
+ImbalanceResult correct_phase_imbalance(const PhaseCurrents& site_A, const std::vector<ImbalanceConnector>& connectors,
+                                        float max_phase_imbalance_A, float unmeasured_A) {
+    auto result = measure_phase_imbalance(site_A, max_phase_imbalance_A);
+    if (not result.reference.has_value()) {
+        return result;
+    }
+    std::vector<Phase> known;
+    for (const auto phase : ALL_PHASES) {
+        if (phase_value(site_A, phase).has_value()) {
+            known.push_back(phase);
+        }
     }
 
     // Connectors on all three phases change no difference and are left alone; the others
@@ -437,8 +457,6 @@ ImbalanceResult correct_phase_imbalance(const PhaseCurrents& site_A, const std::
         })->second;
     for (const auto phase : known) {
         auto& report = report_of(result, phase);
-        report.imbalance_A = phase_value(site_A, phase).value() - reference_A.value();
-        report.overshoot_A = std::max(0.f, report.imbalance_A - max_phase_imbalance_A);
         for (std::size_t i = 0; i < n; i++) {
             if (participants[i]->draws_on.count(phase) > 0) {
                 report.corrected_A += std::max(0.f, participants[i]->measured_A - grant[i]);
