@@ -675,4 +675,218 @@ TEST(PhaseImbalanceLoop, ASuspensionKeepsThePausesInForce) {
     EXPECT_FLOAT_EQ(enforced_current(suspended, "cp05"), 0.0f);
 }
 
+// ---------------------------------------------------------------- published state
+
+namespace {
+
+using types::energy_manager::GridPhase;
+
+const types::energy_manager::PhaseImbalanceLimit* limit_of(const types::energy_manager::PhaseImbalance& state,
+                                                           const std::string& id) {
+    for (const auto& limit : state.connectors) {
+        if (limit.id == id) {
+            return &limit;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+TEST(PhaseImbalanceState, ReportsTheImbalanceAndTheLimitsBelowTheMaximum) {
+    EnergyManagerImpl impl(make_imbalance_config(), [](const auto&) {});
+    impl.run_optimizer(make_example_tree(90.0f, 16.0f, at_plus(0)), AT);
+
+    const auto state = impl.get_phase_imbalance_state();
+
+    EXPECT_EQ(state.timestamp, Everest::Date::to_rfc3339(AT));
+    EXPECT_TRUE(state.enabled);
+    EXPECT_FLOAT_EQ(state.max_phase_imbalance_A, LIMIT_A);
+    EXPECT_FALSE(state.suspended);
+    EXPECT_FALSE(state.suspension_reason.has_value());
+    ASSERT_TRUE(state.reference_phase.has_value());
+    EXPECT_EQ(state.reference_phase.value(), GridPhase::L1);
+    ASSERT_TRUE(state.L1.has_value());
+    EXPECT_FLOAT_EQ(state.L1->current_A, 66.0f);
+    EXPECT_FLOAT_EQ(state.L1->imbalance_A, 0.0f);
+    ASSERT_TRUE(state.L2.has_value());
+    EXPECT_FLOAT_EQ(state.L2->current_A, 90.0f);
+    EXPECT_FLOAT_EQ(state.L2->imbalance_A, 24.0f);
+    EXPECT_FLOAT_EQ(state.L2->overshoot_A, 4.0f);
+    EXPECT_FLOAT_EQ(state.L2->corrected_A.value(), 5.0f);
+    EXPECT_FLOAT_EQ(state.L2->residual_A.value(), 0.0f);
+    ASSERT_TRUE(state.L3.has_value());
+
+    // cp06 is capped at or above its 16 A maximum, which limits nothing.
+    EXPECT_TRUE(state.limiting);
+    EXPECT_EQ(state.connectors.size(), 2u);
+    EXPECT_EQ(limit_of(state, "cp06"), nullptr);
+    const auto* cp02 = limit_of(state, "cp02");
+    ASSERT_NE(cp02, nullptr);
+    EXPECT_FLOAT_EQ(cp02->cap_A, 13.5f);
+    EXPECT_EQ(cp02->since, Everest::Date::to_rfc3339(AT));
+    EXPECT_EQ(cp02->phases, std::vector<GridPhase>{GridPhase::L2});
+}
+
+TEST(PhaseImbalanceState, ReportsTheLimitsInForceNotOnlyThisRunsChanges) {
+    EnergyManagerImpl impl(make_imbalance_config(), [](const auto&) {});
+    impl.run_optimizer(make_example_tree(90.0f, 16.0f, at_plus(0)), AT);
+    impl.run_optimizer(make_example_tree(90.0f, 16.0f, at_plus(5)), AT + std::chrono::seconds(5));
+    ASSERT_TRUE(impl.get_phase_imbalance().caps.empty());
+
+    const auto state = impl.get_phase_imbalance_state();
+
+    const auto* cp02 = limit_of(state, "cp02");
+    ASSERT_NE(cp02, nullptr);
+    EXPECT_FLOAT_EQ(cp02->cap_A, 13.5f);
+    EXPECT_EQ(cp02->since, Everest::Date::to_rfc3339(AT));
+}
+
+TEST(PhaseImbalanceState, SinceIsKeptWhileTheCapMoves) {
+    EnergyManagerImpl impl(make_imbalance_config(), [](const auto&) {});
+    impl.run_optimizer(make_example_tree(90.0f, 16.0f, at_plus(0)), AT);
+    impl.run_optimizer(make_example_tree(88.0f, 14.0f, at_plus(10)), AT + std::chrono::seconds(10));
+
+    const auto state = impl.get_phase_imbalance_state();
+
+    const auto* cp02 = limit_of(state, "cp02");
+    ASSERT_NE(cp02, nullptr);
+    EXPECT_FLOAT_EQ(cp02->cap_A, 12.5f);
+    EXPECT_EQ(cp02->since, Everest::Date::to_rfc3339(AT));
+}
+
+TEST(PhaseImbalanceState, APausedConnectorIsListedAtZeroOnItsPhase) {
+    EnergyManagerImpl impl(make_imbalance_config(), [](const auto&) {});
+    impl.run_optimizer(make_example_tree(124.0f, 16.0f, at_plus(0)), AT);
+
+    const auto state = impl.get_phase_imbalance_state();
+
+    EXPECT_TRUE(state.limiting);
+    const auto* cp02 = limit_of(state, "cp02");
+    ASSERT_NE(cp02, nullptr);
+    EXPECT_FLOAT_EQ(cp02->cap_A, 0.0f);
+    EXPECT_EQ(cp02->phases, std::vector<GridPhase>{GridPhase::L2});
+}
+
+TEST(PhaseImbalanceState, AReleasedLimitIsNoLongerListed) {
+    EnergyManagerImpl impl(make_imbalance_config(), [](const auto&) {});
+    impl.run_optimizer(make_example_tree(90.0f, 16.0f, at_plus(0)), AT);
+
+    // cp02's EV is now seen on all three phases.
+    auto tree = make_example_tree(90.0f, 16.0f, at_plus(10));
+    test::set_measurement_current(tree.children[0], 16.0f, 16.0f, 16.0f, at_plus(10));
+    impl.run_optimizer(tree, AT + std::chrono::seconds(10));
+    ASSERT_TRUE(is_released(impl.get_phase_imbalance(), "cp02"));
+
+    EXPECT_EQ(limit_of(impl.get_phase_imbalance_state(), "cp02"), nullptr);
+}
+
+TEST(PhaseImbalanceState, AStaleMeterSuspensionKeepsTheLimitsAndOmitsTheImbalance) {
+    EnergyManagerImpl impl(make_imbalance_config(), [](const auto&) {});
+    impl.run_optimizer(make_example_tree(124.0f, 16.0f, at_plus(0)), AT);
+
+    // Without the grid meter the site is the sum of the EVSE meters, which report no power.
+    auto tree = make_example_tree(124.0f, 0.0f, at_plus(10));
+    tree.energy_usage_root.reset();
+    impl.run_optimizer(tree, AT + std::chrono::seconds(10));
+
+    const auto state = impl.get_phase_imbalance_state();
+
+    EXPECT_TRUE(state.suspended);
+    ASSERT_TRUE(state.suspension_reason.has_value());
+    EXPECT_EQ(state.suspension_reason.value(), types::energy_manager::PhaseImbalanceSuspensionReason::EvseMetersStale);
+    EXPECT_FALSE(state.reference_phase.has_value());
+    EXPECT_FALSE(state.L1.has_value());
+    EXPECT_FALSE(state.L2.has_value());
+    EXPECT_FALSE(state.L3.has_value());
+    EXPECT_TRUE(state.limiting);
+    EXPECT_NE(limit_of(state, "cp02"), nullptr);
+    EXPECT_NE(limit_of(state, "cp05"), nullptr);
+}
+
+TEST(PhaseImbalanceState, ASinglePhaseSiteMeterSuspendsTheLimiting) {
+    EnergyManagerImpl impl(make_imbalance_config(), [](const auto&) {});
+
+    auto tree = make_example_tree(90.0f, 16.0f, at_plus(0));
+    tree.energy_usage_root.value().current_A.value().L1.reset();
+    tree.energy_usage_root.value().current_A.value().L3.reset();
+    impl.run_optimizer(tree, AT);
+
+    const auto state = impl.get_phase_imbalance_state();
+
+    EXPECT_TRUE(state.suspended);
+    ASSERT_TRUE(state.suspension_reason.has_value());
+    EXPECT_EQ(state.suspension_reason.value(),
+              types::energy_manager::PhaseImbalanceSuspensionReason::InsufficientPhases);
+    EXPECT_FALSE(state.reference_phase.has_value());
+    EXPECT_FALSE(state.L2.has_value());
+}
+
+TEST(PhaseImbalanceState, ResumingClearsTheSuspension) {
+    EnergyManagerImpl impl(make_imbalance_config(), [](const auto&) {});
+    auto tree = make_example_tree(90.0f, 16.0f, at_plus(0));
+    tree.energy_usage_root.reset();
+    impl.run_optimizer(tree, AT);
+    ASSERT_TRUE(impl.get_phase_imbalance_state().suspended);
+
+    impl.run_optimizer(make_example_tree(90.0f, 16.0f, at_plus(10)), AT + std::chrono::seconds(10));
+
+    const auto state = impl.get_phase_imbalance_state();
+    EXPECT_FALSE(state.suspended);
+    EXPECT_FALSE(state.suspension_reason.has_value());
+    EXPECT_TRUE(state.reference_phase.has_value());
+}
+
+TEST(PhaseImbalanceState, WithTheLimitingOffOnlyTheMeasurementIsReported) {
+    auto config = make_imbalance_config();
+    config.phase_symmetry_enabled = false;
+    EnergyManagerImpl impl(config, [](const auto&) {});
+    impl.run_optimizer(make_example_tree(90.0f, 16.0f, at_plus(0)), AT);
+
+    const auto state = impl.get_phase_imbalance_state();
+
+    EXPECT_FALSE(state.enabled);
+    EXPECT_FALSE(state.limiting);
+    EXPECT_TRUE(state.connectors.empty());
+    EXPECT_FALSE(state.suspended);
+    ASSERT_TRUE(state.reference_phase.has_value());
+    EXPECT_EQ(state.reference_phase.value(), GridPhase::L1);
+    ASSERT_TRUE(state.L2.has_value());
+    EXPECT_FLOAT_EQ(state.L2->current_A, 90.0f);
+    EXPECT_FLOAT_EQ(state.L2->imbalance_A, 24.0f);
+    EXPECT_FLOAT_EQ(state.L2->overshoot_A, 4.0f);
+    EXPECT_FALSE(state.L2->corrected_A.has_value());
+    EXPECT_FALSE(state.L2->residual_A.has_value());
+}
+
+TEST(PhaseImbalanceState, FastChargingReportsTheMeasurement) {
+    auto config = make_imbalance_config();
+    config.broker_strategy = "FastCharging";
+    EnergyManagerImpl impl(config, [](const auto&) {});
+    impl.run_optimizer(make_example_tree(90.0f, 16.0f, at_plus(0)), AT);
+
+    const auto state = impl.get_phase_imbalance_state();
+
+    EXPECT_FALSE(state.enabled);
+    EXPECT_TRUE(state.connectors.empty());
+    ASSERT_TRUE(state.L2.has_value());
+    EXPECT_FLOAT_EQ(state.L2->imbalance_A, 24.0f);
+}
+
+TEST(PhaseImbalanceState, WithTheLimitingOffAStaleLeafSumIsNotMeasured) {
+    auto config = make_imbalance_config();
+    config.phase_symmetry_enabled = false;
+    EnergyManagerImpl impl(config, [](const auto&) {});
+
+    auto tree = make_example_tree(90.0f, 16.0f, at_plus(0));
+    tree.energy_usage_root.reset();
+    impl.run_optimizer(tree, AT);
+
+    const auto state = impl.get_phase_imbalance_state();
+
+    EXPECT_FALSE(state.suspended);
+    EXPECT_FALSE(state.reference_phase.has_value());
+    EXPECT_FALSE(state.L1.has_value());
+}
+
 } // namespace module

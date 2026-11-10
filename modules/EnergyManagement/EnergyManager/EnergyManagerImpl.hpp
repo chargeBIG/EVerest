@@ -7,6 +7,7 @@
 #include <generated/interfaces/energy_manager/Implementation.hpp>
 // headers for required interface implementations
 #include <generated/interfaces/energy/Interface.hpp>
+#include <generated/types/energy_manager.hpp>
 
 #include <array>
 #include <mutex>
@@ -68,9 +69,14 @@ struct RedistributionInference {
 class EnergyManagerImpl {
 
 public:
+    using PhaseImbalanceCallback = std::function<void(const types::energy_manager::PhaseImbalance& state)>;
+
+    /// \param phase_imbalance_callback Receives the phase imbalance state after every run of
+    /// the worker thread, after the limits are enforced.
     EnergyManagerImpl(
         const EnergyManagerConfig& config,
-        const std::function<void(const std::vector<types::energy::EnforcedLimits>& limits)>& enforced_limits_callback);
+        const std::function<void(const std::vector<types::energy::EnforcedLimits>& limits)>& enforced_limits_callback,
+        const PhaseImbalanceCallback& phase_imbalance_callback = {});
 
     ~EnergyManagerImpl();
 
@@ -94,6 +100,9 @@ public:
     std::vector<types::energy::EnforcedLimits> run_optimizer(const types::energy::EnergyFlowRequest& request,
                                                              date::utc_clock::time_point start_time,
                                                              const std::string& test_name = "");
+
+    /// \brief The phase imbalance state of the most recent run_optimizer() call.
+    types::energy_manager::PhaseImbalance get_phase_imbalance_state() const;
 
 #ifdef BUILD_TESTING_MODULE_ENERGY_MANAGER
     /// \brief Test observation only: the reading the power redistribution broker last
@@ -137,13 +146,24 @@ private:
     /// releases, and keeps a connector's cap as it is for the hold time after it changed.
     /// Called under energy_mutex.
     void apply_phase_imbalance_correction(const std::vector<std::shared_ptr<Broker>>& brokers);
-    /// \brief Warns once while the limiting decides nothing (\p reason set) with a session
-    /// running, and reports its end.
-    void report_phase_imbalance_suspension(const std::optional<std::string>& reason, bool any_in_session);
+    struct ImbalanceSuspension {
+        types::energy_manager::PhaseImbalanceSuspensionReason reason;
+        std::string detail;
+    };
+    /// \brief Warns once while the limiting decides nothing (\p suspension set) with a
+    /// session running, and reports its end.
+    void report_phase_imbalance_suspension(const std::optional<ImbalanceSuspension>& suspension, bool any_in_session);
+    bool phase_imbalance_limiting_enabled() const;
+    /// \brief The phase imbalance state after this run's correction, from the limits in
+    /// force on \p brokers' connectors. Records in each context since when its connector has
+    /// been held back as it is. Called under energy_mutex.
+    types::energy_manager::PhaseImbalance
+    make_phase_imbalance_state(const std::vector<std::shared_ptr<Broker>>& brokers);
 
     EnergyManagerConfig config;
     BrokerStrategy broker_strategy;
     std::function<void(const std::vector<types::energy::EnforcedLimits>& limits)> enforced_limits_callback;
+    PhaseImbalanceCallback phase_imbalance_callback;
 
     mutable std::mutex energy_mutex;
 
@@ -177,6 +197,8 @@ private:
     // Per phase: whether an uncorrectable overshoot has been reported for this stretch.
     std::array<HoldLatch, 3> m_phase_residual_reported;
     HoldLatch m_phase_imbalance_suspended;
+    std::optional<types::energy_manager::PhaseImbalanceSuspensionReason> m_phase_imbalance_suspension_reason;
+    types::energy_manager::PhaseImbalance m_phase_imbalance_state{};
 };
 
 } // namespace module

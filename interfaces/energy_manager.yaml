@@ -1,2 +1,9 @@
 description: This interface defines the global EnergyManager
-vars: {}
+vars:
+  phase_imbalance:
+    description: >-
+      State of the phase imbalance on the grid connection, published after every optimizer
+      run: the measured imbalance per phase and, while the phase imbalance limiting is
+      enabled, the limits it keeps in force.
+    type: object
+    $ref: /energy_manager#/PhaseImbalance

@@ -1,0 +1,156 @@
+description: Types of the EnergyManager's state
+types:
+  GridPhase:
+    description: An AC grid phase
+    type: string
+    enum:
+      - L1
+      - L2
+      - L3
+  PhaseImbalanceSuspensionReason:
+    description: >-
+      Why the phase imbalance limiting decides nothing.
+      EvseMetersStale: the site measurement is the sum of the EVSE meters, and at least one
+      of them has no fresh reading.
+      InsufficientPhases: fewer than two phases of the site are measured.
+    type: string
+    enum:
+      - EvseMetersStale
+      - InsufficientPhases
+  PhaseImbalancePhase:
+    description: The phase imbalance on one grid phase
+    type: object
+    additionalProperties: false
+    required:
+      - current_A
+      - imbalance_A
+      - overshoot_A
+    properties:
+      current_A:
+        description: Current the site draws on this phase in Ampere
+        type: number
+      imbalance_A:
+        description: Current above the least loaded phase in Ampere; 0 on that phase itself
+        type: number
+      overshoot_A:
+        description: Part of imbalance_A above max_phase_imbalance_A in Ampere
+        type: number
+      corrected_A:
+        description: >-
+          Current the connectors on this phase draw above the limits set in this run, in
+          Ampere: what this run's correction takes away. 0 while the limits in force already
+          keep the phase within max_phase_imbalance_A, so it does not show how far connectors
+          are held back; their limits do. Only while the limiting is enabled.
+        type: number
+      residual_A:
+        description: >-
+          Imbalance above max_phase_imbalance_A that sits in load the EnergyManager does not
+          control, and that limiting connectors therefore cannot remove, in Ampere. Only
+          while the limiting is enabled.
+        type: number
+  PhaseImbalanceLimit:
+    description: A phase imbalance limit in force on one connector
+    type: object
+    additionalProperties: false
+    required:
+      - id
+      - cap_A
+      - since
+      - phases
+    properties:
+      id:
+        description: Energy tree uuid of the connector
+        type: string
+      cap_A:
+        description: Current limit in Ampere; 0 pauses the connector
+        type: number
+      since:
+        description: >-
+          When the connector was capped, or paused, in RFC3339 UTC format. A change of the
+          cap's value keeps it; a change between capped and paused restarts it.
+        type: string
+        format: date-time
+      phases:
+        description: >-
+          Grid phases the connector was last seen drawing on, which the limit acts on. Empty
+          while it has not drawn current yet.
+        type: array
+        items:
+          description: A grid phase
+          type: string
+          $ref: /energy_manager#/GridPhase
+  PhaseImbalance:
+    description: >-
+      State of the phase imbalance on the grid connection, from one optimizer run. The
+      measured imbalance is reported with every broker strategy; limits only while the
+      phase imbalance limiting is enabled.
+    type: object
+    additionalProperties: false
+    required:
+      - timestamp
+      - enabled
+      - max_phase_imbalance_A
+      - limiting
+      - connectors
+      - suspended
+      - support_settled
+    properties:
+      timestamp:
+        description: Time of the optimizer run in RFC3339 UTC format
+        type: string
+        format: date-time
+      enabled:
+        description: >-
+          Whether the phase imbalance limiting is enabled: phase_symmetry_enabled with the
+          broker strategy PowerRedistribution
+        type: boolean
+      max_phase_imbalance_A:
+        description: Largest allowed difference between two grid phases in Ampere
+        type: number
+      reference_phase:
+        description: >-
+          The least loaded phase, which the imbalance of the others is measured against.
+          Absent when fewer than two phases of the site are known, or when the site
+          measurement is the sum of the EVSE meters and one of them is stale.
+        type: string
+        $ref: /energy_manager#/GridPhase
+      L1:
+        description: Phase L1. Absent with reference_phase, or when the site does not report L1.
+        type: object
+        $ref: /energy_manager#/PhaseImbalancePhase
+      L2:
+        description: Phase L2. Absent with reference_phase, or when the site does not report L2.
+        type: object
+        $ref: /energy_manager#/PhaseImbalancePhase
+      L3:
+        description: Phase L3. Absent with reference_phase, or when the site does not report L3.
+        type: object
+        $ref: /energy_manager#/PhaseImbalancePhase
+      limiting:
+        description: >-
+          Whether at least one connector is capped below its own maximum current, or paused
+        type: boolean
+      connectors:
+        description: >-
+          The phase imbalance limits in force below the connector's own maximum current,
+          one per capped or paused connector. A limit at or above that maximum limits
+          nothing and is left out.
+        type: array
+        items:
+          description: A limit in force
+          type: object
+          $ref: /energy_manager#/PhaseImbalanceLimit
+      suspended:
+        description: >-
+          Whether the limiting is suspended during a session: it decides nothing, and the
+          limits in force are kept
+        type: boolean
+      suspension_reason:
+        description: Why the limiting is suspended. Only while suspended.
+        type: string
+        $ref: /energy_manager#/PhaseImbalanceSuspensionReason
+      support_settled:
+        description: >-
+          False when the connectors on the other phases did not settle, and the limits count
+          on no support from them: the tightest limits, for this run
+        type: boolean
