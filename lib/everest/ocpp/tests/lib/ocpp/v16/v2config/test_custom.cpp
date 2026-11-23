@@ -398,6 +398,56 @@ TEST_F(Configuration, SetV2) {
     EXPECT_FALSE(kv.value().readonly);
 }
 
+// A device model in which a component exists only on an EVSE, as with a component config that sets evse_id:
+// looking it up without the EVSE finds nothing.
+class EvseComponentProxy : public MemoryStorageProxy {
+public:
+    EvseComponentProxy(MemoryStorage& obj, std::string evse_component_) :
+        MemoryStorageProxy(obj), evse_component(std::move(evse_component_)) {
+    }
+
+    std::optional<MutabilityEnum> get_mutability(const Component& component_id, const Variable& variable_id,
+                                                 const AttributeEnum& attribute_enum) override {
+        if (component_id.name.get() == evse_component && !component_id.evse.has_value()) {
+            return std::nullopt;
+        }
+        return MemoryStorageProxy::get_mutability(component_id, variable_id, attribute_enum);
+    }
+
+private:
+    std::string evse_component;
+};
+
+TEST_F(Configuration, CustomKeyOnEvseV2) {
+    using ConfigurationStatus = ocpp::v16::ConfigurationStatus;
+    ASSERT_TRUE(device_model);
+
+    ocpp::v2::Component component{"EvseCtrlr"};
+    component.evse = ocpp::v2::EVSE{1};
+    ocpp::v2::Ocpp16CustomConfigMappings mappings;
+    mappings.emplace("EvseKey_1", std::make_pair(component, ocpp::v2::Variable{"EvseKeyVar"}));
+    v2_config = std::make_unique<ocpp::v16::ChargePointConfigurationDeviceModel>(
+        CONFIG_DIR_V16, std::make_unique<EvseComponentProxy>(*device_model, "EvseCtrlr"), std::move(mappings));
+
+    device_model->set("EvseCtrlr", "EvseKeyVar", "");
+
+    // the mutability is looked up on the EVSE: ReadWrite stays writable for the CSMS
+    auto kv = v2_config->get("EvseKey_1");
+    ASSERT_TRUE(kv);
+    EXPECT_EQ(kv.value().value, "");
+    EXPECT_FALSE(kv.value().readonly);
+    EXPECT_EQ(v2_config->set("EvseKey_1", "TAG1"), ConfigurationStatus::Accepted);
+    kv = v2_config->get("EvseKey_1");
+    ASSERT_TRUE(kv);
+    EXPECT_EQ(kv.value().value, "TAG1");
+    EXPECT_FALSE(kv.value().readonly);
+
+    device_model->set_readonly("EvseKeyVar");
+    kv = v2_config->get("EvseKey_1");
+    ASSERT_TRUE(kv);
+    EXPECT_TRUE(kv.value().readonly);
+}
+
 TEST_F(Configuration, SetV2RejectsStackDerivedKeys) {
     ASSERT_TRUE(device_model);
     for (const auto* key :

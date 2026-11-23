@@ -1398,8 +1398,10 @@ std::optional<KeyValue> ChargePointConfigurationDeviceModel::getCustomKeyValue(c
     // a known key without a value is reported without one (OCPP 1.6 KeyValue.value)
     KeyValue kv;
     kv.key = key;
-    kv.readonly =
-        isReadOnly(*storage, component.name.get(), variable.name.get(), v2::AttributeEnum::Actual).value_or(true);
+    // look up the mutability with the full component and variable: a mapping may address a component on an EVSE
+    // or with an instance, which a lookup by name alone does not find (and would then report as read-only)
+    const auto mutability = storage->get_mutability(component, variable, v2::AttributeEnum::Actual);
+    kv.readonly = mutability.value_or(v2::MutabilityEnum::ReadOnly) == v2::MutabilityEnum::ReadOnly;
     if (const auto value = get_optional<std::string>(*storage, component, variable, v2::AttributeEnum::Actual)) {
         kv.value = value.value();
     }
